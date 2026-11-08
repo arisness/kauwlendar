@@ -1,0 +1,8 @@
+# /mnt/us/kauwlendar/calendars.toml
+refresh_minutes = 60
+
+utc_offset_hours = 0
+
+[[calendars]]
+name = "Personal"
+url = "https://calendar.google.com/"
