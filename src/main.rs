@@ -1,256 +1,223 @@
-use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, Timelike, Utc};
-use serde::Deserialize;
-use std::fs;
-use std::path::Path;
-use std::process::Command;
-use std::thread;
-use std::time::Duration as StdDuration;
+mod calendar;
+mod config;
+mod platform;
+mod ui;
 
-const CONFIG_PATH: &str = "/mnt/us/kauwlendar/calendars.toml";
-const CACHE_PATH: &str = "/mnt/us/kauwlendar/cached_events.txt";
+use calendar::fetch_all_calendars;
+use chrono::{DateTime, Datelike, Duration, FixedOffset, Timelike, Utc};
+use config::Config;
+use platform::{
+    get_battery_percent, is_kindle, wait_for_network, InputController, KindleGuard,
+};
+use std::env;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::panic;
+use std::process::{Command, Stdio};
+use ui::screens::{render_dashboard, render_error_screen};
+use ui::Canvas;
 
-#[derive(Deserialize, Debug)]
-struct Config {
-    refresh_minutes: u32,
-    utc_offset_hours: i32,
-    calendars: Vec<CalendarSource>,
-}
-
-#[derive(Deserialize, Debug)]
-struct CalendarSource {
-    name: String,
-    url: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct CalendarEvent {
-    sort_minutes: i32, // -1 para eventos de todo el día, 0..1439 para hora exacta
-    time_label: String,
-    calendar_name: String,
-    summary: String,
+/// Registra mensajes en consola cuando se ejecuta en PC, y en `/tmp/kauwlendar.log` en Kindle
+/// para evitar que el visor de scripts de KPM dibuje logs encima de la mitad inferior de la pantalla.
+fn app_log(msg: &str) {
+    if is_kindle() {
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/kauwlendar.log")
+        {
+            let _ = writeln!(file, "{}", msg);
+        }
+    } else {
+        println!("{}", msg);
+    }
 }
 
 fn main() {
+    // 1. Configurar hook de pánico para que NUNCA deje el Kindle congelado
+    panic::set_hook(Box::new(|info| {
+        let msg = format!("\n[FATAL] Ocurrió un error inesperado (panic):\n{}", info);
+        app_log(&msg);
+        if is_kindle() {
+            for proc_name in &["cvm", "awesome", "mesquite"] {
+                let _ = Command::new("killall")
+                    .args(["-CONT", proc_name])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let _ = Command::new("lipc-set-prop")
+                .args(["com.lab126.powerd", "preventScreenSaver", "0"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }));
+
+    let args: Vec<String> = env::args().collect();
+    let oneshot_mode = args.iter().any(|a| a == "--oneshot" || a == "-1");
+
+    app_log("============================================================");
+    app_log("  Kauwlendar v0.2.0 - Dashboard de Calendario E-Ink");
+    app_log(&format!(
+        "  Plataforma: {}",
+        if is_kindle() { "Kindle" } else { "PC / Desktop" }
+    ));
+    if oneshot_mode {
+        app_log("  Modo: Ejecución única (--oneshot)");
+    }
+    app_log("============================================================");
+
+    // 2. Leer nivel de batería inicial
+    let initial_battery = get_battery_percent();
+
+    // Iniciar guardián de ciclo de vida del Kindle y controlador de entrada
+    let mut guard = KindleGuard::new();
+    let input = InputController::new();
+
+    let mut canvas = Canvas::default_kindle();
+    app_log(&format!(
+        "[INFO] Resolución de lienzo detectada: {}x{} px",
+        canvas.width, canvas.height
+    ));
+
     loop {
-        let config = match load_config() {
+        if input.is_exit_requested() {
+            app_log("[INFO] Salida solicitada por el usuario. Cerrando...");
+            break;
+        }
+
+        input.disarm();
+
+        // 3. Cargar configuración
+        let (config, config_path) = match Config::load() {
             Ok(cfg) => cfg,
             Err(e) => {
-                render_screen(&["ERROR DE CONFIGURACION".to_string(), e]);
-                return;
+                app_log(&format!("[ERROR] Falló la configuración: {}", e));
+                render_error_screen(
+                    &mut canvas,
+                    "Error de Configuración",
+                    &e.to_string(),
+                    "Revisa el archivo de configuración en tu Kindle o en la carpeta local.",
+                );
+                guard.pause_ui();
+                let _ = canvas.render_to_screen();
+
+                if !oneshot_mode {
+                    // En pantalla de error, cualquier toque permite salir
+                    input.arm(true);
+                    app_log("Esperando toque en pantalla o tecla [q] para salir...");
+                    input.wait_for_exit_tap_or_timeout(30);
+                }
+                break;
             }
         };
+
+        app_log(&format!(
+            "[INFO] Configuración cargada desde: {}",
+            config_path.display()
+        ));
 
         let offset = FixedOffset::east_opt(config.utc_offset_hours * 3600)
             .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
         let now = Utc::now().with_timezone(&offset);
-        let hour = now.hour();
 
-        // Sincronizar con Wi-Fi a las 6:00 AM o si aún no existe caché local
-        let should_sync = (hour == 6 && now.minute() < config.refresh_minutes)
-            || !Path::new(CACHE_PATH).exists();
+        // 4. Sincronización fresca al abrir
+        app_log("[INFO] Sincronizando calendarios...");
 
-        let events = if should_sync {
-            set_wifi(true);
-            let fetched = if wait_for_network(20) {
-                fetch_all_calendars(&config, now.date_naive(), &offset)
-            } else {
-                load_cached_events()
-            };
-            set_wifi(false);
-            save_cached_events(&fetched);
-            fetched
+        let events_result = if wait_for_network(5) {
+            fetch_all_calendars(&config, now.date_naive(), &offset)
         } else {
-            load_cached_events()
+            Err(calendar::CalendarFetchError {
+                calendar_name: "Red Wi-Fi".to_string(),
+                url: "".to_string(),
+                error_message: "No se pudo conectar a la red Wi-Fi. Verifica que el Wi-Fi esté encendido."
+                    .to_string(),
+            })
         };
 
-        // Construir las líneas a pintar en la pantalla e-ink
-        let mut lines = Vec::new();
-        lines.push(format!(
-            "=== {:04}-{:02}-{:02} | {:02}:{:02} ===",
-            now.year(),
-            now.month(),
-            now.day(),
-            now.hour(),
-            now.minute()
-        ));
-        lines.push(String::from("----------------------------------------"));
-
-        if events.is_empty() {
-            lines.push(String::from("Sin eventos programados para hoy."));
-        } else {
-            for ev in &events {
-                lines.push(format!(
-                    "{} [{}] {}",
-                    ev.time_label, ev.calendar_name, ev.summary
+        match events_result {
+            Ok(events) => {
+                app_log(&format!(
+                    "[INFO] ¡Sincronización exitosa! {} evento(s) encontrado(s) para hoy.",
+                    events.len()
                 ));
+
+                let battery = get_battery_percent().or(initial_battery);
+                render_dashboard(
+                    &mut canvas,
+                    &now,
+                    &events,
+                    config.time_format,
+                    battery,
+                    config.refresh_minutes,
+                );
+
+                guard.pause_ui();
+                if let Err(e) = canvas.render_to_screen() {
+                    app_log(&format!("[ERROR] Error al renderizar en pantalla: {}", e));
+                }
+
+                // Imprimir resumen en consola SOLO en PC (nunca en Kindle para no ensuciar la pantalla)
+                if !is_kindle() {
+                    print_cli_summary(&now, &events, config.time_format);
+                }
+            }
+            Err(fetch_err) => {
+                app_log(&format!("[ERROR] Falló la sincronización: {}", fetch_err));
+                render_error_screen(
+                    &mut canvas,
+                    "Error de Conexión / Calendario",
+                    &fetch_err.error_message,
+                    &format!(
+                        "Verifica que el Wi-Fi esté activo y que la URL del calendario '{}' sea válida.",
+                        fetch_err.calendar_name
+                    ),
+                );
+                guard.pause_ui();
+                let _ = canvas.render_to_screen();
+
+                if !oneshot_mode {
+                    // En pantalla de error, cualquier toque permite salir
+                    input.arm(true);
+                    app_log("Esperando toque en pantalla o tecla [q] para salir...");
+                    input.wait_for_exit_tap_or_timeout(30);
+                }
+                break;
             }
         }
 
-        // Calcular cuánto tiempo dormir según el horario (6:00 AM a 9:00 PM)
+        if oneshot_mode {
+            app_log("[INFO] Modo --oneshot finalizado con éxito.");
+            break;
+        }
+
+        // 5. Activar escucha táctil SOLO para el botón [SALIR] (allow_any_touch = false)
+        input.arm(false);
+
         let sleep_secs = calculate_sleep_seconds(&now, config.refresh_minutes);
-        if hour >= 21 || hour < 6 {
-            lines.push(String::from("----------------------------------------"));
-            lines.push(String::from("[Modo nocturno: despierta a las 06:00]"));
-        }
-
-        render_screen(&lines);
-
-        // Suspender el Kindle en RAM hasta el próximo ciclo
-        sleep_with_rtcwake(sleep_secs);
-    }
-}
-
-fn load_config() -> Result<Config, String> {
-    let content = fs::read_to_string(CONFIG_PATH)
-        .map_err(|e| format!("No se pudo leer {}: {}", CONFIG_PATH, e))?;
-    toml::from_str(&content).map_err(|e| format!("TOML invalido: {}", e))
-}
-
-fn fetch_all_calendars(
-    config: &Config,
-    today: NaiveDate,
-    offset: &FixedOffset,
-) -> Vec<CalendarEvent> {
-    let mut all_events = Vec::new();
-
-    for cal in &config.calendars {
-        if let Ok(resp) = ureq::get(&cal.url)
-            .timeout(StdDuration::from_secs(15))
-            .call()
-        {
-            if let Ok(body) = resp.into_string() {
-                let mut evs = parse_ics_for_date(&body, &cal.name, today, offset);
-                all_events.append(&mut evs);
-            }
-        }
-    }
-
-    all_events.sort();
-    all_events
-}
-
-fn parse_ics_for_date(
-    ics_raw: &str,
-    cal_name: &str,
-    target_date: NaiveDate,
-    local_offset: &FixedOffset,
-) -> Vec<CalendarEvent> {
-    // Desplegar líneas continuadas según RFC 5545 (CRLF + espacio/tab)
-    let unfolded = ics_raw.replace("\r\n ", "").replace("\n ", "").replace("\r\n\t", "").replace("\n\t", "");
-    let mut events = Vec::new();
-
-    let mut in_event = false;
-    let mut dtstart_raw = String::new();
-    let mut summary = String::new();
-
-    for line in unfolded.lines() {
-        let line = line.trim_end_matches('\r');
-        if line == "BEGIN:VEVENT" {
-            in_event = true;
-            dtstart_raw.clear();
-            summary.clear();
-        } else if line == "END:VEVENT" && in_event {
-            in_event = false;
-            if let Some((date, sort_min, label)) = parse_ical_dtstart(&dtstart_raw, local_offset) {
-                if date == target_date {
-                    events.push(CalendarEvent {
-                        sort_minutes: sort_min,
-                        time_label: label,
-                        calendar_name: cal_name.to_string(),
-                        summary: clean_ical_text(&summary),
-                    });
-                }
-            }
-        } else if in_event {
-            if line.starts_with("DTSTART") {
-                if let Some((_, val)) = line.split_once(':') {
-                    dtstart_raw = val.trim().to_string();
-                }
-            } else if let Some(val) = line.strip_prefix("SUMMARY:") {
-                summary = val.trim().to_string();
-            } else if line.starts_with("SUMMARY;") {
-                if let Some((_, val)) = line.split_once(':') {
-                    summary = val.trim().to_string();
-                }
-            }
-        }
-    }
-
-    events
-}
-
-fn parse_ical_dtstart(raw: &str, local_offset: &FixedOffset) -> Option<(NaiveDate, i32, String)> {
-    // Caso 1: Evento de día completo (YYYYMMDD)
-    if raw.len() == 8 {
-        let date = NaiveDate::parse_from_str(raw, "%Y%m%d").ok()?;
-        return Some((date, -1, String::from("Todo el dia")));
-    }
-
-    // Caso 2: Fecha y hora en UTC (YYYYMMDDTHHMMSSZ)
-    if raw.ends_with('Z') && raw.len() >= 16 {
-        let clean = raw.trim_end_matches('Z');
-        let naive = NaiveDateTime::parse_from_str(clean, "%Y%m%dT%H%M%S").ok()?;
-        let utc_dt = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
-        let local_dt = utc_dt.with_timezone(local_offset);
-        let mins = (local_dt.hour() * 60 + local_dt.minute()) as i32;
-        let label = format!("{:02}:{:02}", local_dt.hour(), local_dt.minute());
-        return Some((local_dt.date_naive(), mins, label));
-    }
-
-    // Caso 3: Fecha y hora local (YYYYMMDDTHHMMSS)
-    if raw.len() >= 15 {
-        let slice = &raw[..15];
-        let naive = NaiveDateTime::parse_from_str(slice, "%Y%m%dT%H%M%S").ok()?;
-        let mins = (naive.hour() * 60 + naive.minute()) as i32;
-        let label = format!("{:02}:{:02}", naive.hour(), naive.minute());
-        return Some((naive.date(), mins, label));
-    }
-
-    None
-}
-
-fn clean_ical_text(text: &str) -> String {
-    text.replace("\\,", ",")
-        .replace("\\;", ";")
-        .replace("\\n", " ")
-        .replace("\\\\", "\\")
-}
-
-fn save_cached_events(events: &[CalendarEvent]) {
-    let mut data = String::new();
-    for ev in events {
-        data.push_str(&format!(
-            "{}|{}|{}|{}\n",
-            ev.sort_minutes, ev.time_label, ev.calendar_name, ev.summary
+        app_log(&format!(
+            "[INFO] Pantalla activa (toca [SALIR] para cerrar). Próxima actualización en {} minutos ({} segundos)...",
+            sleep_secs / 60,
+            sleep_secs
         ));
-    }
-    let _ = fs::write(CACHE_PATH, data);
-}
 
-fn load_cached_events() -> Vec<CalendarEvent> {
-    let mut events = Vec::new();
-    if let Ok(content) = fs::read_to_string(CACHE_PATH) {
-        for line in content.lines() {
-            let parts: Vec<&str> = line.splitn(4, '|').collect();
-            if parts.len() == 4 {
-                if let Ok(sort_minutes) = parts[0].parse::<i32>() {
-                    events.push(CalendarEvent {
-                        sort_minutes,
-                        time_label: parts[1].to_string(),
-                        calendar_name: parts[2].to_string(),
-                        summary: parts[3].to_string(),
-                    });
-                }
-            }
+        if input.wait_for_exit_tap_or_timeout(sleep_secs as u64) {
+            app_log("[INFO] Toque en [SALIR] detectado. Volviendo al menú de Kindle...");
+            break;
         }
     }
-    events
+
+    guard.restore();
+    app_log("[INFO] Kauwlendar finalizó correctamente.");
 }
 
 fn calculate_sleep_seconds(now: &DateTime<FixedOffset>, refresh_mins: u32) -> i64 {
     let hour = now.hour();
 
-    // Si son las 9:00 PM (21:00) o más tarde, dormir directo hasta las 6:00 AM de mañana
+    // Modo nocturno: de 21:00 (9 PM) a 06:00 AM
     if hour >= 21 {
         let tomorrow = now.date_naive() + Duration::days(1);
         if let Some(target_naive) = tomorrow.and_hms_opt(6, 0, 0) {
@@ -261,7 +228,6 @@ fn calculate_sleep_seconds(now: &DateTime<FixedOffset>, refresh_mins: u32) -> i6
         return 9 * 3600;
     }
 
-    // Si despertó de madrugada antes de las 6:00 AM, dormir hasta las 6:00 AM de hoy
     if hour < 6 {
         if let Some(target_naive) = now.date_naive().and_hms_opt(6, 0, 0) {
             if let Some(target) = target_naive.and_local_timezone(*now.offset()).single() {
@@ -270,80 +236,27 @@ fn calculate_sleep_seconds(now: &DateTime<FixedOffset>, refresh_mins: u32) -> i6
         }
     }
 
-    // Entre 6:00 AM y 8:59 PM: alinear al siguiente bloque (ej. :00 o :30)
-    let step = refresh_mins.max(1) as i64 * 60;
+    // Horas diurnas: alinear al siguiente slot
+    let step = refresh_mins.max(5) as i64 * 60;
     let secs_today = (now.hour() * 3600 + now.minute() * 60 + now.second()) as i64;
     let next_slot = ((secs_today / step) + 1) * step;
     (next_slot - secs_today).max(60)
 }
 
-fn set_wifi(enable: bool) {
-    let val = if enable { "1" } else { "0" };
-    let _ = Command::new("lipc-set-prop")
-        .args(["com.lab126.cmd", "wirelessEnable", val])
-        .status();
-}
-
-fn wait_for_network(timeout_secs: u32) -> bool {
-    for _ in 0..timeout_secs {
-        if let Ok(out) = Command::new("ip").args(["-4", "addr", "show", "wlan0"]).output() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if stdout.contains("inet ") {
-                thread::sleep(StdDuration::from_secs(2)); // Espera breve para DNS/rutas
-                return true;
-            }
-        }
-        thread::sleep(StdDuration::from_secs(1));
-    }
-    false
-}
-
-fn render_screen(lines: &[String]) {
-    let fbink_path = "/mnt/us/koreader/fbink";
-    if Path::new(fbink_path).exists() {
-        // Limpiar pantalla con fbink (-c) sin parpadeo agresivo
-        let _ = Command::new(fbink_path).args(["-q", "-c"]).status();
-
-        for (idx, line) in lines.iter().enumerate() {
-            let row = (idx * 2 + 2).to_string();
-            // El "--" evita que fbink confunda lineas que empiezan por "-" con flags
-            let _ = Command::new(fbink_path)
-                .args(["-q", "-y", &row, "--", line])
-                .status();
-        }
+fn print_cli_summary(
+    now: &DateTime<FixedOffset>,
+    events: &[calendar::CalendarEvent],
+    format: config::TimeFormat,
+) {
+    println!("\n------------------------------------------------------------");
+    println!("  AGENDA PARA HOY: {:04}-{:02}-{:02} | Formato: {}", now.year(), now.month(), now.day(), format);
+    println!("------------------------------------------------------------");
+    if events.is_empty() {
+        println!("  (No hay eventos programados)");
     } else {
-        let _ = Command::new("eips").arg("-c").status();
-        for (idx, line) in lines.iter().enumerate() {
-            let row = (idx * 2 + 2).to_string();
-            let safe_line: String = line
-                .chars()
-                .map(|c| if c.is_ascii() { c } else { '?' })
-                .take(48)
-                .collect();
-            let _ = Command::new("eips").args(["2", &row, &safe_line]).status();
+        for ev in events {
+            println!("  [{:>11}]  {:<12} {}", ev.time_label(format), format!("[{}]", ev.calendar_name), ev.summary);
         }
     }
-}
-
-fn sleep_with_rtcwake(seconds: i64) {
-    // Habilitar permisos de wakeup en el kernel para rtc0 y rtc1
-    let _ = fs::write("/sys/class/rtc/rtc0/device/power/wakeup", "enabled");
-    let _ = fs::write("/sys/class/rtc/rtc1/device/power/wakeup", "enabled");
-
-    let sec_str = seconds.to_string();
-
-    // Intentar primero con rtc0, si falla probar con rtc1
-    let status_rtc0 = Command::new("rtcwake")
-        .args(["-d", "rtc0", "-m", "mem", "-s", &sec_str])
-        .status();
-
-    if status_rtc0.map(|s| !s.success()).unwrap_or(true) {
-        let status_rtc1 = Command::new("rtcwake")
-            .args(["-d", "rtc1", "-m", "mem", "-s", &sec_str])
-            .status();
-
-        if status_rtc1.map(|s| !s.success()).unwrap_or(true) {
-            thread::sleep(StdDuration::from_secs(seconds as u64));
-        }
-    }
+    println!("------------------------------------------------------------\n");
 }
