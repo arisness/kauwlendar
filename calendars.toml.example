@@ -1,8 +1,23 @@
-# /mnt/us/kauwlendar/calendars.toml
+# Configuration file: /mnt/us/kauwlendar/calendars.toml (on Kindle)
+# or ./calendars.toml (on your PC for local development and testing)
+
+# Refresh interval in minutes during the day (minimum 5)
 refresh_minutes = 60
 
+# Timezone offset in hours relative to UTC (e.g., 0 for UTC, -4 for UTC-4, -5 for UTC-5)
 utc_offset_hours = 0
 
+# Time display format:
+# "12h" -> AM/PM format (e.g., 10:30 AM, 02:15 PM)
+# "24h" -> 24-hour format (e.g., 10:30, 14:15)
+time_format = "12h"
+
+# Calendar list (you can add multiple [[calendars]] blocks)
+# In Google Calendar: Calendar Settings -> "Secret address in iCal format"
 [[calendars]]
 name = "Personal"
-url = "https://calendar.google.com/"
+url = "https://calendar.google.com/calendar/ical/YOUR_EMAIL/private-xxxx/basic.ics"
+
+# [[calendars]]
+# name = "Work"
+# url = "https://outlook.office365.com/owa/calendar/xxxx/reachcalendar.ics"
