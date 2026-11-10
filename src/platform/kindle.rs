@@ -36,16 +36,25 @@ fn run_quiet(cmd: &str, args: &[&str]) -> bool {
 
 pub struct KindleGuard {
     active: bool,
+    pub initial_wifi: bool,
 }
 
 impl KindleGuard {
     pub fn new() -> Self {
         let is_k = is_kindle();
+        let initial_wifi = if is_k {
+            get_wifi_state()
+        } else {
+            true
+        };
         if is_k {
             // Evitar que powerd active el salvapantallas sin matar el servicio powerd
             run_quiet("lipc-set-prop", &["com.lab126.powerd", "preventScreenSaver", "1"]);
         }
-        Self { active: is_k }
+        Self {
+            active: is_k,
+            initial_wifi,
+        }
     }
 
     /// Pausa los procesos de interfaz gráfica de Kindle justo antes de dibujar en el framebuffer
@@ -60,15 +69,18 @@ impl KindleGuard {
 
     pub fn restore(&mut self) {
         if self.active {
-            // 1. Reanudar inmediatamente los procesos de la interfaz gráfica de Kindle
+            // 1. Restaurar el estado original del Wi-Fi del Kindle
+            set_wifi(self.initial_wifi);
+
+            // 2. Reanudar inmediatamente los procesos de la interfaz gráfica de Kindle
             for proc_name in &["cvm", "awesome", "mesquite"] {
                 run_quiet("killall", &["-CONT", proc_name]);
             }
 
-            // 2. Restaurar el comportamiento normal del salvapantallas en powerd
+            // 3. Restaurar el comportamiento normal del salvapantallas en powerd
             run_quiet("lipc-set-prop", &["com.lab126.powerd", "preventScreenSaver", "0"]);
 
-            // 3. Limpiar el framebuffer con refresco completo para que la UI de Kindle se repinte limpia
+            // 4. Limpiar el framebuffer con refresco completo para que la UI de Kindle se repinte limpia
             let fbink = find_fbink_bin();
             if !run_quiet(fbink, &["-q", "-c", "-f"]) {
                 for eips in &["/usr/sbin/eips", "/usr/bin/eips", "eips"] {
@@ -197,9 +209,52 @@ pub fn get_screen_dimensions() -> (u32, u32) {
     (1072, 1448)
 }
 
-#[allow(dead_code)]
-pub fn set_wifi(_enable: bool) {
-    // Opción A: No alterar el estado de Wi-Fi del usuario bajo ninguna circunstancia
+pub fn get_wifi_state() -> bool {
+    if is_kindle() {
+        if let Ok(out) = Command::new("lipc-get-prop")
+            .args(["com.lab126.cmd", "wirelessEnable"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            return text.trim() == "1";
+        }
+    }
+    true
+}
+
+pub fn set_wifi(enable: bool) {
+    if is_kindle() {
+        let val = if enable { "1" } else { "0" };
+
+        // Intentar con flag entera (-i) y sin ella para compatibilidad con todas las versiones de Kindle
+        let _ = Command::new("lipc-set-prop")
+            .args(["-i", "com.lab126.cmd", "wirelessEnable", val])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        let _ = Command::new("lipc-set-prop")
+            .args(["com.lab126.cmd", "wirelessEnable", val])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        let _ = Command::new("lipc-set-prop")
+            .args(["-i", "com.lab126.wifid", "enable", val])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        let _ = Command::new("lipc-set-prop")
+            .args(["com.lab126.wifid", "enable", val])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 pub fn wait_for_network(timeout_secs: u32) -> bool {
