@@ -1,13 +1,22 @@
+use crate::config::Language;
 use crate::ui::canvas::{
     Canvas, COLOR_BLACK, COLOR_DARK_GRAY, COLOR_GRAY, COLOR_LIGHT_GRAY, COLOR_WHITE,
 };
 use crate::ui::fonts::{font_bold, font_regular};
+use crate::ui::i18n::get_translations;
 
-pub fn render_error_screen(canvas: &mut Canvas, title: &str, details: &str, suggestion: &str) {
+pub fn render_error_screen(
+    canvas: &mut Canvas,
+    title: &str,
+    details: &str,
+    suggestion: &str,
+    language: Language,
+) {
     canvas.fill(COLOR_WHITE);
 
     let reg = font_regular();
     let bold = font_bold();
+    let i18n = get_translations(language);
 
     let scale = (canvas.width as f32 / 1072.0).clamp(0.55, 1.2);
     let margin = (40.0 * scale).round() as u32;
@@ -17,7 +26,7 @@ pub fn render_error_screen(canvas: &mut Canvas, title: &str, details: &str, sugg
     canvas.draw_rect_fill(0, 0, canvas.width, header_h, COLOR_BLACK);
     let h_sz = (40.0 * scale).round();
     let h_y = (header_h as f32 - h_sz) / 2.0;
-    canvas.draw_text(&bold, "⚠️ ERROR EN KAUWLENDAR", margin as i32, h_y as i32, h_sz, COLOR_WHITE);
+    canvas.draw_text(&bold, i18n.error_header, margin as i32, h_y as i32, h_sz, COLOR_WHITE);
 
     // 2. Tarjeta principal de error
     let content_w = canvas.width.saturating_sub(2 * margin);
@@ -48,7 +57,7 @@ pub fn render_error_screen(canvas: &mut Canvas, title: &str, details: &str, sugg
     // Sugerencia
     if !suggestion.is_empty() {
         detail_y += (20.0 * scale).round() as u32;
-        canvas.draw_text(&bold, "Sugerencia:", (margin + (30.0 * scale) as u32) as i32, detail_y as i32, text_sz, COLOR_BLACK);
+        canvas.draw_text(&bold, i18n.error_suggestion_label, (margin + (30.0 * scale) as u32) as i32, detail_y as i32, text_sz, COLOR_BLACK);
         detail_y += (30.0 * scale).round() as u32;
         for line in wrap_lines(suggestion, max_chars) {
             if detail_y > box_y + box_h - (40.0 * scale) as u32 {
@@ -66,7 +75,7 @@ pub fn render_error_screen(canvas: &mut Canvas, title: &str, details: &str, sugg
     let btn_y = box_y + box_h + (50.0 * scale).round() as u32;
 
     canvas.draw_rounded_rect_fill(btn_x, btn_y, btn_w, btn_h, 14, COLOR_BLACK);
-    let btn_label = "SALIR AL KINDLE";
+    let btn_label = i18n.error_exit_button;
     let btn_lbl_sz = (32.0 * scale).round();
     let (lbl_w, _) = Canvas::measure_text(&bold, btn_label, btn_lbl_sz);
     let lbl_x = btn_x as f32 + (btn_w as f32 - lbl_w) / 2.0;
@@ -74,7 +83,7 @@ pub fn render_error_screen(canvas: &mut Canvas, title: &str, details: &str, sugg
     canvas.draw_text(&bold, btn_label, lbl_x as i32, lbl_y as i32, btn_lbl_sz, COLOR_WHITE);
 
     // Subtítulo de instrucción
-    let exit_sub = "Toca la pantalla para volver al menú de Kindle";
+    let exit_sub = i18n.error_exit_sub;
     let sub_sz = (22.0 * scale).round();
     let (sub_w, _) = Canvas::measure_text(&reg, exit_sub, sub_sz);
     let sub_x = (canvas.width as f32 - sub_w) / 2.0;

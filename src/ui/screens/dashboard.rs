@@ -1,10 +1,11 @@
 use crate::calendar::CalendarEvent;
-use crate::config::TimeFormat;
+use crate::config::{Language, TimeFormat};
 use crate::ui::canvas::{
     Canvas, COLOR_BLACK, COLOR_DARK_GRAY, COLOR_GRAY, COLOR_LIGHT_GRAY, COLOR_WHITE,
 };
 use crate::ui::fonts::{font_bold, font_regular};
-use chrono::{DateTime, Datelike, FixedOffset, Timelike};
+use crate::ui::i18n::get_translations;
+use chrono::{DateTime, FixedOffset, Timelike};
 
 pub fn render_dashboard(
     canvas: &mut Canvas,
@@ -12,12 +13,13 @@ pub fn render_dashboard(
     events: &[CalendarEvent],
     time_format: TimeFormat,
     battery_level: Option<u32>,
-    _refresh_minutes: u32,
+    language: Language,
 ) {
     canvas.fill(COLOR_WHITE);
 
     let reg = font_regular();
     let bold = font_bold();
+    let i18n = get_translations(language);
 
     // Factor de escala relativo a la resolución base (1072x1448)
     let scale = (canvas.width as f32 / 1072.0).clamp(0.6, 1.4);
@@ -28,8 +30,8 @@ pub fn render_dashboard(
     // 1. BARRA SUPERIOR (HEADER) EN ALTO CONTRASTE
     canvas.draw_rect_fill(0, 0, canvas.width, header_h, COLOR_BLACK);
 
-    // Fecha en español (grande, blanca pura y en negrita)
-    let date_str = format_date_spanish(now);
+    // Fecha en el idioma configurado (grande, blanca pura y en negrita)
+    let date_str = (i18n.format_date)(now);
     let date_font_sz = (42.0 * scale).round();
     let date_y = (30.0 * scale).round() as i32;
     canvas.draw_text(&bold, &date_str, margin as i32, date_y, date_font_sz, COLOR_WHITE);
@@ -40,7 +42,7 @@ pub fn render_dashboard(
     let time_y = (86.0 * scale).round() as i32;
     canvas.draw_text(&bold, &time_str, margin as i32, time_y, time_font_sz, COLOR_WHITE);
 
-    // Botón [SALIR] grande y cómodo en la esquina superior derecha
+    // Botón [SALIR] / [EXIT] grande y cómodo en la esquina superior derecha
     let exit_btn_w = (220.0 * scale).round() as u32;
     let exit_btn_h = (88.0 * scale).round() as u32;
     let exit_btn_x = canvas.width.saturating_sub(exit_btn_w + margin);
@@ -48,10 +50,10 @@ pub fn render_dashboard(
 
     canvas.draw_rounded_rect_fill(exit_btn_x, exit_btn_y, exit_btn_w, exit_btn_h, 14, COLOR_WHITE);
     let exit_font_sz = (36.0 * scale).round();
-    let (lbl_w, _) = Canvas::measure_text(&bold, "SALIR", exit_font_sz);
+    let (lbl_w, _) = Canvas::measure_text(&bold, i18n.exit_button, exit_font_sz);
     let lbl_x = exit_btn_x as i32 + ((exit_btn_w as f32 - lbl_w) / 2.0) as i32;
     let lbl_y = exit_btn_y as i32 + ((exit_btn_h as f32 - exit_font_sz) / 2.0) as i32;
-    canvas.draw_text(&bold, "SALIR", lbl_x, lbl_y, exit_font_sz, COLOR_BLACK);
+    canvas.draw_text(&bold, i18n.exit_button, lbl_x, lbl_y, exit_font_sz, COLOR_BLACK);
 
     // Indicador de batería grande y muy legible (42px)
     if let Some(batt) = battery_level {
@@ -95,7 +97,7 @@ pub fn render_dashboard(
     let section_title_sz = (34.0 * scale).round();
 
     if !all_day_events.is_empty() {
-        canvas.draw_text(&bold, "TODO EL DÍA", margin as i32, current_y as i32, section_title_sz, COLOR_DARK_GRAY);
+        canvas.draw_text(&bold, i18n.all_day_header, margin as i32, current_y as i32, section_title_sz, COLOR_DARK_GRAY);
         current_y += (42.0 * scale).round() as u32;
         canvas.draw_line_h(margin, current_y, content_w, 2, COLOR_LIGHT_GRAY);
         current_y += (18.0 * scale).round() as u32;
@@ -108,7 +110,7 @@ pub fn render_dashboard(
             let badge_h = (48.0 * scale).round() as u32;
             let badge_y = current_y + (22.0 * scale) as u32;
 
-            let all_day_lbl = "TODO EL DÍA";
+            let all_day_lbl = i18n.all_day_badge;
             let ad_sz = (28.0 * scale).round();
             let (ad_w, _) = Canvas::measure_text(&bold, all_day_lbl, ad_sz);
             let ad_box_w = (ad_w + 30.0 * scale).round() as u32;
@@ -137,8 +139,8 @@ pub fn render_dashboard(
         current_y += (15.0 * scale).round() as u32;
     }
 
-    // Título de sección "AGENDA DE HOY"
-    canvas.draw_text(&bold, "AGENDA DE HOY", margin as i32, current_y as i32, section_title_sz, COLOR_BLACK);
+    // Título de sección "AGENDA DE HOY" / "TODAY'S AGENDA"
+    canvas.draw_text(&bold, i18n.today_agenda_header, margin as i32, current_y as i32, section_title_sz, COLOR_BLACK);
     current_y += (42.0 * scale).round() as u32;
     canvas.draw_line_h(margin, current_y, content_w, 3, COLOR_BLACK);
     current_y += (22.0 * scale).round() as u32;
@@ -152,13 +154,13 @@ pub fn render_dashboard(
         canvas.draw_rounded_rect_fill(margin, box_y, content_w, box_h, 16, COLOR_LIGHT_GRAY);
         canvas.draw_rect_outline(margin, box_y, content_w, box_h, 3, COLOR_GRAY);
 
-        let msg1 = "Sin eventos programados para hoy";
+        let msg1 = i18n.no_events_title;
         let msg1_sz = (38.0 * scale).round();
         let (m1_w, _) = Canvas::measure_text(&bold, msg1, msg1_sz);
         let m1_x = (canvas.width as f32 - m1_w) / 2.0;
         canvas.draw_text(&bold, msg1, m1_x as i32, (box_y + (70.0 * scale) as u32) as i32, msg1_sz, COLOR_BLACK);
 
-        let msg2 = "Disfruta de tu día libre o añade eventos a tus calendarios.";
+        let msg2 = i18n.no_events_subtitle;
         let msg2_sz = (26.0 * scale).round();
         let (m2_w, _) = Canvas::measure_text(&reg, msg2, msg2_sz);
         let m2_x = (canvas.width as f32 - m2_w) / 2.0;
@@ -166,7 +168,7 @@ pub fn render_dashboard(
     } else {
         for ev in timed_events {
             if current_y + card_h > max_y {
-                canvas.draw_text(&bold, "... y más eventos restantes", (margin + 10) as i32, current_y as i32, (26.0 * scale).round(), COLOR_DARK_GRAY);
+                canvas.draw_text(&bold, i18n.more_events_hint, (margin + 10) as i32, current_y as i32, (26.0 * scale).round(), COLOR_DARK_GRAY);
                 break;
             }
 
@@ -210,7 +212,7 @@ pub fn render_dashboard(
     let footer_y = canvas.height.saturating_sub(footer_h);
     canvas.draw_line_h(margin, footer_y, content_w, 2, COLOR_LIGHT_GRAY);
 
-    let exit_hint = "Toca [SALIR] para volver a Kindle";
+    let exit_hint = i18n.footer_hint;
     let footer_sz = (24.0 * scale).round();
     let (hint_w, _) = Canvas::measure_text(&reg, exit_hint, footer_sz);
     let hint_x = (canvas.width as f32 - hint_w) / 2.0;
@@ -234,27 +236,6 @@ fn format_current_time(now: &DateTime<FixedOffset>, format: TimeFormat) -> Strin
     }
 }
 
-fn format_date_spanish(dt: &DateTime<FixedOffset>) -> String {
-    let day_name = match dt.weekday() {
-        chrono::Weekday::Mon => "Lunes",
-        chrono::Weekday::Tue => "Martes",
-        chrono::Weekday::Wed => "Miércoles",
-        chrono::Weekday::Thu => "Jueves",
-        chrono::Weekday::Fri => "Viernes",
-        chrono::Weekday::Sat => "Sábado",
-        chrono::Weekday::Sun => "Domingo",
-    };
-
-    let month_name = match dt.month() {
-        1 => "Enero", 2 => "Febrero", 3 => "Marzo", 4 => "Abril",
-        5 => "Mayo", 6 => "Junio", 7 => "Julio", 8 => "Agosto",
-        9 => "Septiembre", 10 => "Octubre", 11 => "Noviembre", 12 => "Diciembre",
-        _ => "",
-    };
-
-    format!("{}, {} de {} de {}", day_name, dt.day(), month_name, dt.year())
-}
-
 fn truncate_text(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         text.to_string()
@@ -270,8 +251,9 @@ mod tests {
     use super::*;
     use chrono::{NaiveDate, NaiveTime};
 
+
     #[test]
-    fn test_render_dashboard_large_layout() {
+    fn test_render_dashboard_english() {
         let mut canvas = Canvas::new(1072, 1448);
         let offset = FixedOffset::east_opt(-4 * 3600).unwrap();
         let now = NaiveDate::from_ymd_opt(2026, 11, 8)
@@ -281,14 +263,11 @@ mod tests {
             .unwrap();
 
         let events = vec![
-            CalendarEvent::new_timed("Personal", "Event 1", 6 * 60)
-                .with_end_minutes(7 * 60 + 45)
-                .with_description("Morning routine notes"),
-            CalendarEvent::new_timed("Work", "Event 2", 9 * 60)
-                .with_end_minutes(10 * 60 + 30),
+            CalendarEvent::new_timed("Work", "Morning Standup", 9 * 60)
+                .with_end_minutes(10 * 60),
         ];
 
-        render_dashboard(&mut canvas, &now, &events, TimeFormat::H12, Some(89), 30);
+        render_dashboard(&mut canvas, &now, &events, TimeFormat::H12, Some(95), Language::En);
         assert_eq!(canvas.width, 1072);
         assert_eq!(canvas.height, 1448);
     }

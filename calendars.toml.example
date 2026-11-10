@@ -12,6 +12,11 @@ utc_offset_hours = 0
 # "24h" -> 24-hour format (e.g., 10:30, 14:15)
 time_format = "12h"
 
+# Interface language:
+# "en" -> English (default): [ EXIT ], "Monday, November 09, 2026", "All Day"
+# "es" -> Spanish: [ SALIR ], "Lunes, 09 de Noviembre de 2026", "Todo el día"
+language = "en"
+
 # Calendar list (you can add multiple [[calendars]] blocks)
 # In Google Calendar: Calendar Settings -> "Secret address in iCal format"
 [[calendars]]

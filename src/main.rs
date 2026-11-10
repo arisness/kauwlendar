@@ -5,7 +5,7 @@ mod ui;
 
 use calendar::fetch_all_calendars;
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Timelike, Utc};
-use config::Config;
+use config::{Config, Language};
 use platform::{
     get_battery_percent, is_kindle, wait_for_network, InputController, KindleGuard,
 };
@@ -101,6 +101,7 @@ fn main() {
                     "Error de Configuración",
                     &e.to_string(),
                     "Revisa el archivo de configuración en tu Kindle o en la carpeta local.",
+                    Language::Es,
                 );
                 guard.pause_ui();
                 let _ = canvas.render_to_screen();
@@ -152,7 +153,7 @@ fn main() {
                     &events,
                     config.time_format,
                     battery,
-                    config.refresh_minutes,
+                    config.language,
                 );
 
                 guard.pause_ui();
@@ -175,6 +176,7 @@ fn main() {
                         "Verifica que el Wi-Fi esté activo y que la URL del calendario '{}' sea válida.",
                         fetch_err.calendar_name
                     ),
+                    config.language,
                 );
                 guard.pause_ui();
                 let _ = canvas.render_to_screen();
@@ -258,5 +260,4 @@ fn print_cli_summary(
             println!("  [{:>11}]  {:<12} {}", ev.time_label(format), format!("[{}]", ev.calendar_name), ev.summary);
         }
     }
-    println!("------------------------------------------------------------\n");
 }
