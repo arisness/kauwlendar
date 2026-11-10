@@ -11,6 +11,7 @@ pub fn render_dashboard(
     canvas: &mut Canvas,
     now: &DateTime<FixedOffset>,
     events: &[CalendarEvent],
+    start_idx: usize,
     time_format: TimeFormat,
     battery_level: Option<u32>,
     language: Language,
@@ -71,27 +72,34 @@ pub fn render_dashboard(
         canvas.draw_text(&bold, &batt_str, b_text_x, b_text_y, batt_font_sz, COLOR_WHITE);
     }
 
-    // 2. CUERPO DE EVENTOS (TARJETAS GRANDES Y ESPACIOSAS)
+    // 2. CUERPO DE EVENTOS (VENTANA ACTIVA DE HASTA 4 EVENTOS)
+    let total_events = events.len();
+    let page_size = 4;
+    let visible_events: &[CalendarEvent] = if total_events <= page_size {
+        events
+    } else {
+        let start = start_idx.min(total_events.saturating_sub(page_size));
+        let end = (start + page_size).min(total_events);
+        &events[start..end]
+    };
+
     let mut current_y = header_h + (32.0 * scale).round() as u32;
     let content_w = canvas.width.saturating_sub(2 * margin);
 
     let (all_day_events, timed_events): (Vec<&CalendarEvent>, Vec<&CalendarEvent>) =
-        events.iter().partition(|e| e.is_all_day);
+        visible_events.iter().partition(|e| e.is_all_day);
 
-    let total_events = all_day_events.len() + timed_events.len();
+    let visible_count = visible_events.len();
 
-    // Altura adaptativa de tarjeta según la cantidad de eventos para aprovechar la pantalla
-    let card_h = match total_events {
+    // Altura adaptativa de tarjeta asegurando tamaño grande para 4 o menos eventos
+    let card_h = match visible_count {
         0..=2 => (240.0 * scale).round() as u32,
         3 => (220.0 * scale).round() as u32,
-        4 => (195.0 * scale).round() as u32,
-        5 => (160.0 * scale).round() as u32,
-        _ => (135.0 * scale).round() as u32,
+        _ => (195.0 * scale).round() as u32,
     };
-    let card_gap = match total_events {
+    let card_gap = match visible_count {
         0..=3 => (24.0 * scale).round() as u32,
-        4 => (20.0 * scale).round() as u32,
-        _ => (14.0 * scale).round() as u32,
+        _ => (20.0 * scale).round() as u32,
     };
 
     let section_title_sz = (34.0 * scale).round();
@@ -140,13 +148,14 @@ pub fn render_dashboard(
     }
 
     // Título de sección "AGENDA DE HOY" / "TODAY'S AGENDA"
-    canvas.draw_text(&bold, i18n.today_agenda_header, margin as i32, current_y as i32, section_title_sz, COLOR_BLACK);
-    current_y += (42.0 * scale).round() as u32;
-    canvas.draw_line_h(margin, current_y, content_w, 3, COLOR_BLACK);
-    current_y += (22.0 * scale).round() as u32;
+    if !timed_events.is_empty() || events.is_empty() {
+        canvas.draw_text(&bold, i18n.today_agenda_header, margin as i32, current_y as i32, section_title_sz, COLOR_BLACK);
+        current_y += (42.0 * scale).round() as u32;
+        canvas.draw_line_h(margin, current_y, content_w, 3, COLOR_BLACK);
+        current_y += (22.0 * scale).round() as u32;
+    }
 
     let footer_h = (65.0 * scale).round() as u32;
-    let max_y = canvas.height.saturating_sub(footer_h + (20.0 * scale) as u32);
 
     if timed_events.is_empty() && events.is_empty() {
         let box_y = current_y + (40.0 * scale).round() as u32;
@@ -167,11 +176,6 @@ pub fn render_dashboard(
         canvas.draw_text(&reg, msg2, m2_x as i32, (box_y + (140.0 * scale) as u32) as i32, msg2_sz, COLOR_DARK_GRAY);
     } else {
         for ev in timed_events {
-            if current_y + card_h > max_y {
-                canvas.draw_text(&bold, i18n.more_events_hint, (margin + 10) as i32, current_y as i32, (26.0 * scale).round(), COLOR_DARK_GRAY);
-                break;
-            }
-
             canvas.draw_rounded_rect_fill(margin, current_y, content_w, card_h, 14, COLOR_LIGHT_GRAY);
             canvas.draw_rect_outline(margin, current_y, content_w, card_h, 2, COLOR_DARK_GRAY);
 
@@ -179,7 +183,7 @@ pub fn render_dashboard(
             let badge_h = (48.0 * scale).round() as u32;
             let badge_y = current_y + (22.0 * scale) as u32;
 
-            // Pastilla de hora negra de alto contraste (muestra inicio - fin si está disponible)
+            // Pastilla de hora negra de alto contraste
             let time_label = ev.time_label(time_format);
             let t_sz = (30.0 * scale).round();
             let (t_w, _) = Canvas::measure_text(&bold, &time_label, t_sz);
@@ -208,15 +212,39 @@ pub fn render_dashboard(
         }
     }
 
-    // 3. BARRA INFERIOR (FOOTER MINIMALISTA Y LIMPIO)
+    // 3. BARRA INFERIOR (FOOTER / INDICADOR DE PAGINACIÓN SIN BOTONES)
     let footer_y = canvas.height.saturating_sub(footer_h);
     canvas.draw_line_h(margin, footer_y, content_w, 2, COLOR_LIGHT_GRAY);
 
-    let exit_hint = i18n.footer_hint;
     let footer_sz = (24.0 * scale).round();
-    let (hint_w, _) = Canvas::measure_text(&reg, exit_hint, footer_sz);
-    let hint_x = (canvas.width as f32 - hint_w) / 2.0;
-    canvas.draw_text(&reg, exit_hint, hint_x as i32, (footer_y + (22.0 * scale) as u32) as i32, footer_sz, COLOR_DARK_GRAY);
+    let text_y = (footer_y + (22.0 * scale) as u32) as i32;
+
+    if total_events <= page_size {
+        let exit_hint = i18n.footer_hint;
+        let (hint_w, _) = Canvas::measure_text(&reg, exit_hint, footer_sz);
+        let hint_x = (canvas.width as f32 - hint_w) / 2.0;
+        canvas.draw_text(&reg, exit_hint, hint_x as i32, text_y, footer_sz, COLOR_DARK_GRAY);
+    } else {
+        let (current_page, total_pages) = crate::calendar::calculate_pagination(start_idx, total_events, page_size);
+        let page_text = (i18n.pagination_page_of)(current_page, total_pages);
+        let (p_w, _) = Canvas::measure_text(&bold, &page_text, footer_sz);
+        let center_x = (canvas.width as f32 - p_w) / 2.0;
+        canvas.draw_text(&bold, &page_text, center_x as i32, text_y, footer_sz, COLOR_BLACK);
+
+        // Indicador a la izquierda si hay eventos previos
+        if start_idx > 0 {
+            let prev_text = i18n.pagination_prev_hint;
+            canvas.draw_text(&bold, prev_text, margin as i32, text_y, footer_sz, COLOR_DARK_GRAY);
+        }
+
+        // Indicador a la derecha si hay eventos futuros
+        if start_idx + page_size < total_events {
+            let next_text = i18n.pagination_next_hint;
+            let (n_w, _) = Canvas::measure_text(&bold, next_text, footer_sz);
+            let next_x = (canvas.width - margin) as f32 - n_w;
+            canvas.draw_text(&bold, next_text, next_x as i32, text_y, footer_sz, COLOR_DARK_GRAY);
+        }
+    }
 }
 
 fn format_current_time(now: &DateTime<FixedOffset>, format: TimeFormat) -> String {
@@ -253,7 +281,7 @@ mod tests {
 
 
     #[test]
-    fn test_render_dashboard_english() {
+    fn test_render_dashboard_english_with_pagination() {
         let mut canvas = Canvas::new(1072, 1448);
         let offset = FixedOffset::east_opt(-4 * 3600).unwrap();
         let now = NaiveDate::from_ymd_opt(2026, 11, 8)
@@ -263,11 +291,18 @@ mod tests {
             .unwrap();
 
         let events = vec![
-            CalendarEvent::new_timed("Work", "Morning Standup", 9 * 60)
-                .with_end_minutes(10 * 60),
+            CalendarEvent::new_timed("Work", "Event 1", 9 * 60).with_end_minutes(10 * 60),
+            CalendarEvent::new_timed("Work", "Event 2", 11 * 60).with_end_minutes(12 * 60),
+            CalendarEvent::new_timed("Work", "Event 3", 13 * 60).with_end_minutes(14 * 60),
+            CalendarEvent::new_timed("Work", "Event 4", 15 * 60).with_end_minutes(16 * 60),
+            CalendarEvent::new_timed("Work", "Event 5", 17 * 60).with_end_minutes(18 * 60),
+            CalendarEvent::new_timed("Work", "Event 6", 19 * 60).with_end_minutes(20 * 60),
         ];
 
-        render_dashboard(&mut canvas, &now, &events, TimeFormat::H12, Some(95), Language::En);
+        // Página 1 (eventos 0..4)
+        render_dashboard(&mut canvas, &now, &events, 0, TimeFormat::H12, Some(95), Language::En);
+        // Página 2 (eventos 2..6, últimos 4)
+        render_dashboard(&mut canvas, &now, &events, 2, TimeFormat::H12, Some(95), Language::En);
         assert_eq!(canvas.width, 1072);
         assert_eq!(canvas.height, 1448);
     }

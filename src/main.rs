@@ -3,11 +3,12 @@ mod config;
 mod platform;
 mod ui;
 
-use calendar::fetch_all_calendars;
+use calendar::{calculate_initial_start_index, fetch_all_calendars};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Timelike, Utc};
 use config::{Config, Language};
 use platform::{
     get_battery_percent, is_kindle, set_wifi, wait_for_network, InputController, KindleGuard,
+    UserAction,
 };
 use std::env;
 use std::fs::OpenOptions;
@@ -85,8 +86,9 @@ fn main() {
 
     let mut last_sync_date: Option<NaiveDate> = None;
     let mut cached_events: Vec<calendar::CalendarEvent> = Vec::new();
+    let mut current_start: usize = 0;
 
-    loop {
+    'main_loop: loop {
         if input.is_exit_requested() {
             app_log("[INFO] Salida solicitada por el usuario. Cerrando...");
             break;
@@ -162,6 +164,8 @@ fn main() {
                     ));
                     cached_events = events;
                     last_sync_date = Some(today);
+                    let cur_mins = (now.hour() * 60 + now.minute()) as i32;
+                    current_start = calculate_initial_start_index(&cached_events, cur_mins);
                 }
                 Err(fetch_err) => {
                     app_log(&format!("[ERROR] Falló la sincronización: {}", fetch_err));
@@ -184,7 +188,7 @@ fn main() {
                             app_log("Esperando toque en pantalla o tecla [q] para salir...");
                             input.wait_for_exit_tap_or_timeout(30);
                         }
-                        break;
+                        break 'main_loop;
                     } else {
                         app_log("[WARN] Manteniendo eventos en memoria previos tras fallo de sincronización.");
                     }
@@ -202,6 +206,7 @@ fn main() {
             &mut canvas,
             &now,
             &cached_events,
+            current_start,
             config.time_format,
             battery,
             config.language,
@@ -219,10 +224,12 @@ fn main() {
 
         if oneshot_mode {
             app_log("[INFO] Modo --oneshot finalizado con éxito.");
-            break;
+            break 'main_loop;
         }
 
-        // 5. Activar escucha táctil SOLO para el botón [SALIR] (allow_any_touch = false)
+        // 5. Activar escucha táctil:
+        // - Esquina superior derecha: Botón [SALIR]
+        // - Debajo de la cabecera (mitad izq / der): Paginación de eventos (sin botones)
         input.arm(false);
 
         let sleep_secs = calculate_sleep_seconds(&now, config.refresh_minutes);
@@ -232,9 +239,57 @@ fn main() {
             sleep_secs
         ));
 
-        if input.wait_for_exit_tap_or_timeout(sleep_secs as u64) {
-            app_log("[INFO] Toque en [SALIR] detectado. Volviendo al menú de Kindle...");
-            break;
+        let start_wait = std::time::Instant::now();
+        let total_sleep = sleep_secs as u64;
+
+        loop {
+            let elapsed = start_wait.elapsed().as_secs();
+            if elapsed >= total_sleep {
+                // Timeout cumplido: actualizar el índice activo para centrar el evento actual
+                let cur_mins = (now.hour() * 60 + now.minute()) as i32;
+                current_start = calculate_initial_start_index(&cached_events, cur_mins);
+                break;
+            }
+
+            let remaining = total_sleep - elapsed;
+            match input.wait_for_action_or_timeout(remaining) {
+                Some(UserAction::Exit) => {
+                    app_log("[INFO] Toque en [SALIR] detectado. Volviendo al menú de Kindle...");
+                    break 'main_loop;
+                }
+                Some(UserAction::PagePrev) => {
+                    if current_start > 0 {
+                        current_start = current_start.saturating_sub(4);
+                        app_log(&format!(
+                            "[INFO] Navegando a eventos anteriores (índice inicio: {})",
+                            current_start
+                        ));
+                        break;
+                    } else {
+                        app_log("[INFO] Ya estás en los primeros eventos.");
+                    }
+                }
+                Some(UserAction::PageNext) => {
+                    let total = cached_events.len();
+                    let max_start = total.saturating_sub(4);
+                    if current_start < max_start {
+                        current_start = (current_start + 4).min(max_start);
+                        app_log(&format!(
+                            "[INFO] Navegando a eventos siguientes (índice inicio: {})",
+                            current_start
+                        ));
+                        break;
+                    } else {
+                        app_log("[INFO] Ya estás en los últimos eventos.");
+                    }
+                }
+                None => {
+                    // Timeout cumplido
+                    let cur_mins = (now.hour() * 60 + now.minute()) as i32;
+                    current_start = calculate_initial_start_index(&cached_events, cur_mins);
+                    break;
+                }
+            }
         }
     }
 
