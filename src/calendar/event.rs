@@ -106,6 +106,60 @@ impl PartialOrd for CalendarEvent {
     }
 }
 
+/// Encuentra el índice del evento en curso o el próximo a ocurrir.
+/// Si todos ya pasaron, retorna el índice que permite mostrar los últimos 4 eventos.
+pub fn find_active_event_index(events: &[CalendarEvent], current_minutes: i32) -> usize {
+    if events.is_empty() {
+        return 0;
+    }
+
+    // 1. Buscar evento con hora que esté actualmente en curso
+    for (i, ev) in events.iter().enumerate() {
+        if !ev.is_all_day {
+            let end_m = ev.end_minutes.unwrap_or(ev.start_minutes + 60);
+            if ev.start_minutes <= current_minutes && current_minutes < end_m {
+                return i;
+            }
+        }
+    }
+
+    // 2. Si ninguno está en curso, buscar el próximo evento futuro
+    for (i, ev) in events.iter().enumerate() {
+        if !ev.is_all_day && ev.start_minutes > current_minutes {
+            return i;
+        }
+    }
+
+    // 3. Si todos los eventos con hora ya terminaron, enfocarse hacia el final
+    events.len().saturating_sub(4)
+}
+
+/// Calcula el índice de inicio asegurando que se vean 4 eventos (o menos si el total es menor a 4),
+/// colocando el evento activo al principio y sin dejar huecos en blanco al final.
+pub fn calculate_initial_start_index(events: &[CalendarEvent], current_minutes: i32) -> usize {
+    let total = events.len();
+    if total <= 4 {
+        0
+    } else {
+        let active_idx = find_active_event_index(events, current_minutes);
+        active_idx.min(total.saturating_sub(4))
+    }
+}
+
+/// Calcula el número de página actual (1-indexed) y el total de páginas
+pub fn calculate_pagination(start_idx: usize, total_events: usize, page_size: usize) -> (usize, usize) {
+    if total_events <= page_size {
+        return (1, 1);
+    }
+    let total_pages = (total_events + page_size - 1) / page_size;
+    if start_idx + page_size >= total_events {
+        (total_pages, total_pages)
+    } else {
+        let page = (start_idx / page_size) + 1;
+        (page.min(total_pages), total_pages)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +195,61 @@ mod tests {
         list.sort();
 
         assert_eq!(list, vec![all_day, morning, afternoon]);
+    }
+
+    #[test]
+    fn test_active_event_index_detection() {
+        let events = vec![
+            CalendarEvent::new_timed("Test", "Morning", 9 * 60).with_end_minutes(10 * 60), // 0: 09:00 - 10:00
+            CalendarEvent::new_timed("Test", "Noon", 12 * 60).with_end_minutes(13 * 60),    // 1: 12:00 - 13:00
+            CalendarEvent::new_timed("Test", "Afternoon", 15 * 60).with_end_minutes(16 * 60), // 2: 15:00 - 16:00
+            CalendarEvent::new_timed("Test", "Evening 1", 17 * 60).with_end_minutes(18 * 60), // 3: 17:00 - 18:00
+            CalendarEvent::new_timed("Test", "Evening 2", 18 * 60).with_end_minutes(19 * 60), // 4: 18:00 - 19:00
+            CalendarEvent::new_timed("Test", "Night", 20 * 60).with_end_minutes(21 * 60),     // 5: 20:00 - 21:00
+        ];
+
+        // A las 08:30 (antes del primer evento): próximo es index 0
+        assert_eq!(find_active_event_index(&events, 8 * 60 + 30), 0);
+        assert_eq!(calculate_initial_start_index(&events, 8 * 60 + 30), 0);
+
+        // A las 09:15 (evento 0 en curso): activo es index 0
+        assert_eq!(find_active_event_index(&events, 9 * 60 + 15), 0);
+        assert_eq!(calculate_initial_start_index(&events, 9 * 60 + 15), 0);
+
+        // A las 12:30 (evento 1 en curso): activo es index 1
+        assert_eq!(find_active_event_index(&events, 12 * 60 + 30), 1);
+        assert_eq!(calculate_initial_start_index(&events, 12 * 60 + 30), 1);
+
+        // A las 15:10 (evento 2 en curso): activo es index 2
+        // total = 6, 6 - 4 = 2. initial_start = min(2, 2) = 2 (muestra [2, 3, 4, 5])
+        assert_eq!(find_active_event_index(&events, 15 * 60 + 10), 2);
+        assert_eq!(calculate_initial_start_index(&events, 15 * 60 + 10), 2);
+
+        // A las 19:30 (evento 4 ya terminó, próximo es index 5 a las 20:00):
+        // total = 6, 6 - 4 = 2. min(5, 2) = 2. Siempre deja 4 eventos en vista!
+        assert_eq!(find_active_event_index(&events, 19 * 60 + 30), 5);
+        assert_eq!(calculate_initial_start_index(&events, 19 * 60 + 30), 2);
+
+        // A las 22:00 (todos terminaron): deja los últimos 4
+        assert_eq!(find_active_event_index(&events, 22 * 60), 2);
+        assert_eq!(calculate_initial_start_index(&events, 22 * 60), 2);
+    }
+
+    #[test]
+    fn test_pagination_calculation() {
+        // <= 4 eventos -> siempre 1 de 1
+        assert_eq!(calculate_pagination(0, 3, 4), (1, 1));
+        assert_eq!(calculate_pagination(0, 4, 4), (1, 1));
+
+        // 7 eventos (2 páginas)
+        assert_eq!(calculate_pagination(0, 7, 4), (1, 2));
+        assert_eq!(calculate_pagination(2, 7, 4), (1, 2));
+        assert_eq!(calculate_pagination(3, 7, 4), (2, 2));
+
+        // 10 eventos (3 páginas)
+        assert_eq!(calculate_pagination(0, 10, 4), (1, 3));
+        assert_eq!(calculate_pagination(4, 10, 4), (2, 3));
+        assert_eq!(calculate_pagination(6, 10, 4), (3, 3));
     }
 }
 
