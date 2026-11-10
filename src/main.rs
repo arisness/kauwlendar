@@ -4,10 +4,10 @@ mod platform;
 mod ui;
 
 use calendar::fetch_all_calendars;
-use chrono::{DateTime, Datelike, Duration, FixedOffset, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Timelike, Utc};
 use config::{Config, Language};
 use platform::{
-    get_battery_percent, is_kindle, wait_for_network, InputController, KindleGuard,
+    get_battery_percent, is_kindle, set_wifi, wait_for_network, InputController, KindleGuard,
 };
 use std::env;
 use std::fs::OpenOptions;
@@ -83,6 +83,9 @@ fn main() {
         canvas.width, canvas.height
     ));
 
+    let mut last_sync_date: Option<NaiveDate> = None;
+    let mut cached_events: Vec<calendar::CalendarEvent> = Vec::new();
+
     loop {
         if input.is_exit_requested() {
             app_log("[INFO] Salida solicitada por el usuario. Cerrando...");
@@ -124,71 +127,94 @@ fn main() {
         let offset = FixedOffset::east_opt(config.utc_offset_hours * 3600)
             .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
         let now = Utc::now().with_timezone(&offset);
+        let today = now.date_naive();
 
-        // 4. Sincronización fresca al abrir
-        app_log("[INFO] Sincronizando calendarios...");
+        // 4. Sincronización inteligente de Wi-Fi:
+        // Solo conecta al ENTRAR a la app o a partir de las 6:00 AM si cambió de día.
+        let is_first_run = last_sync_date.is_none();
+        let is_morning_update = last_sync_date != Some(today) && now.hour() >= 6;
+        let should_sync_network = is_first_run || is_morning_update;
 
-        let events_result = if wait_for_network(5) {
-            fetch_all_calendars(&config, now.date_naive(), &offset)
+        if should_sync_network {
+            app_log("[INFO] Asegurando Wi-Fi encendido para sincronizar calendarios...");
+            set_wifi(true);
+
+            app_log("[INFO] Sincronizando calendarios desde la red...");
+            let events_result = if wait_for_network(15) {
+                fetch_all_calendars(&config, today, &offset)
+            } else {
+                Err(calendar::CalendarFetchError {
+                    calendar_name: "Red Wi-Fi".to_string(),
+                    url: "".to_string(),
+                    error_message: "No se pudo conectar a la red Wi-Fi tras encenderla. Verifica la señal y el router.".to_string(),
+                })
+            };
+
+            // Apagar siempre el Wi-Fi tras sincronizar para ahorrar batería mientras el dashboard está visible
+            app_log("[INFO] Sincronización completada. Apagando Wi-Fi para ahorrar batería...");
+            set_wifi(false);
+
+            match events_result {
+                Ok(events) => {
+                    app_log(&format!(
+                        "[INFO] ¡Sincronización exitosa! {} evento(s) encontrado(s) para hoy.",
+                        events.len()
+                    ));
+                    cached_events = events;
+                    last_sync_date = Some(today);
+                }
+                Err(fetch_err) => {
+                    app_log(&format!("[ERROR] Falló la sincronización: {}", fetch_err));
+                    if is_first_run {
+                        render_error_screen(
+                            &mut canvas,
+                            "Error de Conexión / Calendario",
+                            &fetch_err.error_message,
+                            &format!(
+                                "Verifica que el Wi-Fi esté activo y que la URL del calendario '{}' sea válida.",
+                                fetch_err.calendar_name
+                            ),
+                            config.language,
+                        );
+                        guard.pause_ui();
+                        let _ = canvas.render_to_screen();
+
+                        if !oneshot_mode {
+                            input.arm(true);
+                            app_log("Esperando toque en pantalla o tecla [q] para salir...");
+                            input.wait_for_exit_tap_or_timeout(30);
+                        }
+                        break;
+                    } else {
+                        app_log("[WARN] Manteniendo eventos en memoria previos tras fallo de sincronización.");
+                    }
+                }
+            }
         } else {
-            Err(calendar::CalendarFetchError {
-                calendar_name: "Red Wi-Fi".to_string(),
-                url: "".to_string(),
-                error_message: "No se pudo conectar a la red Wi-Fi. Verifica que el Wi-Fi esté encendido."
-                    .to_string(),
-            })
-        };
+            app_log(&format!(
+                "[INFO] Actualizando pantalla con eventos en memoria ({} eventos). Wi-Fi apagado.",
+                cached_events.len()
+            ));
+        }
 
-        match events_result {
-            Ok(events) => {
-                app_log(&format!(
-                    "[INFO] ¡Sincronización exitosa! {} evento(s) encontrado(s) para hoy.",
-                    events.len()
-                ));
+        let battery = get_battery_percent().or(initial_battery);
+        render_dashboard(
+            &mut canvas,
+            &now,
+            &cached_events,
+            config.time_format,
+            battery,
+            config.language,
+        );
 
-                let battery = get_battery_percent().or(initial_battery);
-                render_dashboard(
-                    &mut canvas,
-                    &now,
-                    &events,
-                    config.time_format,
-                    battery,
-                    config.language,
-                );
+        guard.pause_ui();
+        if let Err(e) = canvas.render_to_screen() {
+            app_log(&format!("[ERROR] Error al renderizar en pantalla: {}", e));
+        }
 
-                guard.pause_ui();
-                if let Err(e) = canvas.render_to_screen() {
-                    app_log(&format!("[ERROR] Error al renderizar en pantalla: {}", e));
-                }
-
-                // Imprimir resumen en consola SOLO en PC (nunca en Kindle para no ensuciar la pantalla)
-                if !is_kindle() {
-                    print_cli_summary(&now, &events, config.time_format);
-                }
-            }
-            Err(fetch_err) => {
-                app_log(&format!("[ERROR] Falló la sincronización: {}", fetch_err));
-                render_error_screen(
-                    &mut canvas,
-                    "Error de Conexión / Calendario",
-                    &fetch_err.error_message,
-                    &format!(
-                        "Verifica que el Wi-Fi esté activo y que la URL del calendario '{}' sea válida.",
-                        fetch_err.calendar_name
-                    ),
-                    config.language,
-                );
-                guard.pause_ui();
-                let _ = canvas.render_to_screen();
-
-                if !oneshot_mode {
-                    // En pantalla de error, cualquier toque permite salir
-                    input.arm(true);
-                    app_log("Esperando toque en pantalla o tecla [q] para salir...");
-                    input.wait_for_exit_tap_or_timeout(30);
-                }
-                break;
-            }
+        // Imprimir resumen en consola SOLO en PC (nunca en Kindle para no ensuciar la pantalla)
+        if !is_kindle() {
+            print_cli_summary(&now, &cached_events, config.time_format);
         }
 
         if oneshot_mode {
@@ -260,4 +286,5 @@ fn print_cli_summary(
             println!("  [{:>11}]  {:<12} {}", ev.time_label(format), format!("[{}]", ev.calendar_name), ev.summary);
         }
     }
+    println!("------------------------------------------------------------\n");
 }
