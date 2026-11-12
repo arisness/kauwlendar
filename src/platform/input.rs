@@ -2,9 +2,9 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const ACTION_NONE: u8 = 0;
 pub const ACTION_EXIT: u8 = 1;
@@ -23,7 +23,9 @@ pub struct InputController {
     exit_requested: Arc<AtomicBool>,
     action_flag: Arc<AtomicU8>,
     armed: Arc<AtomicBool>,
+    button_armed: Arc<AtomicBool>,
     any_touch_exits: Arc<AtomicBool>,
+    notifier: Arc<(Mutex<()>, Condvar)>,
 }
 
 impl InputController {
@@ -32,62 +34,84 @@ impl InputController {
         let action_flag = Arc::new(AtomicU8::new(ACTION_NONE));
         // Inicia desarmado para ignorar el toque residual de apertura en KPM
         let armed = Arc::new(AtomicBool::new(false));
+        let button_armed = Arc::new(AtomicBool::new(false));
         let any_touch_exits = Arc::new(AtomicBool::new(false));
+        let notifier = Arc::new((Mutex::new(()), Condvar::new()));
 
-        // 1. Escucha para PC (terminal stdin)
-        let exit_pc = Arc::clone(&exit_requested);
-        let action_pc = Arc::clone(&action_flag);
-        thread::spawn(move || {
-            let mut buffer = String::new();
-            while !exit_pc.load(Ordering::SeqCst) {
-                buffer.clear();
-                match std::io::stdin().read_line(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let trimmed = buffer.trim().to_lowercase();
-                        if trimmed == "q" || trimmed == "exit" || trimmed == "salir" {
-                            exit_pc.store(true, Ordering::SeqCst);
-                            action_pc.store(ACTION_EXIT, Ordering::SeqCst);
-                            break;
-                        } else if trimmed == "a" || trimmed == "left" || trimmed == "prev" || trimmed == "<" {
-                            action_pc.store(ACTION_PAGE_PREV, Ordering::SeqCst);
-                        } else if trimmed == "d" || trimmed == "right" || trimmed == "next" || trimmed == ">" {
-                            action_pc.store(ACTION_PAGE_NEXT, Ordering::SeqCst);
+        // 1. Escucha para PC (terminal stdin) — solo en entorno de escritorio
+        if !crate::platform::is_kindle() {
+            let exit_pc = Arc::clone(&exit_requested);
+            let action_pc = Arc::clone(&action_flag);
+            let notify_pc = Arc::clone(&notifier);
+            thread::spawn(move || {
+                let mut buffer = String::new();
+                while !exit_pc.load(Ordering::SeqCst) {
+                    buffer.clear();
+                    match std::io::stdin().read_line(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let trimmed = buffer.trim().to_lowercase();
+                            if trimmed == "q" || trimmed == "exit" || trimmed == "salir" {
+                                exit_pc.store(true, Ordering::SeqCst);
+                                action_pc.store(ACTION_EXIT, Ordering::SeqCst);
+                                notify_waiters(&notify_pc);
+                                break;
+                            } else if trimmed == "a"
+                                || trimmed == "left"
+                                || trimmed == "prev"
+                                || trimmed == "<"
+                            {
+                                action_pc.store(ACTION_PAGE_PREV, Ordering::SeqCst);
+                                notify_waiters(&notify_pc);
+                            } else if trimmed == "d"
+                                || trimmed == "right"
+                                || trimmed == "next"
+                                || trimmed == ">"
+                            {
+                                action_pc.store(ACTION_PAGE_NEXT, Ordering::SeqCst);
+                                notify_waiters(&notify_pc);
+                            }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
-            }
-        });
+            });
+        }
 
-        // 2. Escucha en todos los dispositivos de entrada de Kindle (/dev/input/event*)
+        // 2. Escucha en los dispositivos de entrada de Kindle (/dev/input/event*)
         listen_kindle_all_inputs(
             Arc::clone(&exit_requested),
             Arc::clone(&action_flag),
             Arc::clone(&armed),
+            Arc::clone(&button_armed),
             Arc::clone(&any_touch_exits),
+            Arc::clone(&notifier),
         );
 
         Self {
             exit_requested,
             action_flag,
             armed,
+            button_armed,
             any_touch_exits,
+            notifier,
         }
     }
 
-    /// Activa la detección táctil después de haber dibujado la pantalla,
+    /// Activa la detección táctil y de botón físico después de haber dibujado la pantalla,
     /// descartando cualquier toque residual previo (ej. al abrir desde KPM).
     pub fn arm(&self, allow_any_touch: bool) {
         thread::sleep(Duration::from_millis(400));
         self.any_touch_exits.store(allow_any_touch, Ordering::SeqCst);
         self.exit_requested.store(false, Ordering::SeqCst);
         self.action_flag.store(ACTION_NONE, Ordering::SeqCst);
+        self.button_armed.store(true, Ordering::SeqCst);
         self.armed.store(true, Ordering::SeqCst);
     }
 
     pub fn disarm(&self) {
         self.armed.store(false, Ordering::SeqCst);
+        self.button_armed.store(false, Ordering::SeqCst);
     }
 
     pub fn is_exit_requested(&self) -> bool {
@@ -99,6 +123,7 @@ impl InputController {
     pub fn request_exit(&self) {
         self.exit_requested.store(true, Ordering::SeqCst);
         self.action_flag.store(ACTION_EXIT, Ordering::SeqCst);
+        notify_waiters(&self.notifier);
     }
 
     pub fn poll_action(&self) -> Option<UserAction> {
@@ -117,28 +142,79 @@ impl InputController {
         }
     }
 
-    /// Espera una acción de usuario (tocar SALIR, página previa, página siguiente) o timeout
+    /// Espera una acción de usuario (bloqueando el hilo con 0% de uso de CPU mediante Condvar) o timeout
     pub fn wait_for_action_or_timeout(&self, timeout_secs: u64) -> Option<UserAction> {
-        let start = std::time::Instant::now();
-        while start.elapsed().as_secs() < timeout_secs {
+        if let Some(act) = self.poll_action() {
+            return Some(act);
+        }
+        if timeout_secs == 0 {
+            return None;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let (lock, cvar) = &*self.notifier;
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        loop {
             if let Some(act) = self.poll_action() {
                 return Some(act);
             }
-            thread::sleep(Duration::from_millis(100));
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline - now;
+            match cvar.wait_timeout(guard, remaining) {
+                Ok((g, _)) => guard = g,
+                Err(poisoned) => guard = poisoned.into_inner().0,
+            }
         }
+
         self.poll_action()
     }
 
-    /// Espera un toque válido o tecla para salir durante `timeout_secs` segundos
+    /// Espera un toque válido o tecla para salir durante `timeout_secs` segundos sin polling
     pub fn wait_for_exit_tap_or_timeout(&self, timeout_secs: u64) -> bool {
-        let start = std::time::Instant::now();
-        while start.elapsed().as_secs() < timeout_secs {
+        if self.is_exit_requested() {
+            return true;
+        }
+        if timeout_secs == 0 {
+            return false;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let (lock, cvar) = &*self.notifier;
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        loop {
             if self.is_exit_requested() {
                 return true;
             }
-            thread::sleep(Duration::from_millis(100));
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline - now;
+            match cvar.wait_timeout(guard, remaining) {
+                Ok((g, _)) => guard = g,
+                Err(poisoned) => guard = poisoned.into_inner().0,
+            }
         }
+
         self.is_exit_requested()
+    }
+}
+
+fn notify_waiters(notifier: &Arc<(Mutex<()>, Condvar)>) {
+    let (lock, cvar) = &**notifier;
+    if let Ok(_guard) = lock.lock() {
+        cvar.notify_all();
     }
 }
 
@@ -177,7 +253,9 @@ fn listen_kindle_all_inputs(
     exit_flag: Arc<AtomicBool>,
     action_flag: Arc<AtomicU8>,
     armed_flag: Arc<AtomicBool>,
+    button_armed_flag: Arc<AtomicBool>,
     any_touch_flag: Arc<AtomicBool>,
+    notifier: Arc<(Mutex<()>, Condvar)>,
 ) {
     let (screen_w, screen_h) = crate::platform::get_screen_dimensions();
 
@@ -186,7 +264,9 @@ fn listen_kindle_all_inputs(
             let exit_f = Arc::clone(&exit_flag);
             let action_f = Arc::clone(&action_flag);
             let armed = Arc::clone(&armed_flag);
+            let btn_armed = Arc::clone(&button_armed_flag);
             let any_touch = Arc::clone(&any_touch_flag);
+            let notify = Arc::clone(&notifier);
 
             thread::spawn(move || {
                 // En Linux 32-bit (Kindle ARMv7) input_event es 16 bytes; en 64-bit es 24 bytes
@@ -198,17 +278,38 @@ fn listen_kindle_all_inputs(
                 let mut current_x: i32 = -1;
                 let mut current_y: i32 = -1;
                 let mut touch_down_in_frame = false;
+                let mut consecutive_errors: u8 = 0;
 
                 loop {
+                    if exit_f.load(Ordering::SeqCst) {
+                        break;
+                    }
+
                     if file.read_exact(&mut buf[..packet_size]).is_ok() {
+                        consecutive_errors = 0;
                         let ev_type = u16::from_ne_bytes([buf[type_offset], buf[type_offset + 1]]);
-                        let ev_code = u16::from_ne_bytes([buf[type_offset + 2], buf[type_offset + 3]]);
+                        let ev_code =
+                            u16::from_ne_bytes([buf[type_offset + 2], buf[type_offset + 3]]);
                         let ev_value = i32::from_ne_bytes([
                             buf[type_offset + 4],
                             buf[type_offset + 5],
                             buf[type_offset + 6],
                             buf[type_offset + 7],
                         ]);
+
+                        // 1. Botón físico de encendido / inicio (cualquier tecla EV_KEY distinta al toque BTN_TOUCH = 330):
+                        // Se evalúa siempre que button_armed esté activo
+                        if ev_type == 1
+                            && ev_value == 1
+                            && ev_code != 330
+                            && ev_code != 325
+                            && btn_armed.load(Ordering::SeqCst)
+                        {
+                            exit_f.store(true, Ordering::SeqCst);
+                            action_f.store(ACTION_EXIT, Ordering::SeqCst);
+                            notify_waiters(&notify);
+                            break;
+                        }
 
                         // Actualizar siempre las últimas coordenadas X / Y reportadas por el panel táctil
                         if ev_type == 3 {
@@ -244,18 +345,9 @@ fn listen_kindle_all_inputs(
                             continue;
                         }
 
-                        // EV_KEY = 1 (botones físicos o contacto táctil)
-                        if ev_type == 1 && ev_value == 1 {
-                            // Botón físico de encendido (KEY_POWER = 116) o inicio (KEY_HOME = 102)
-                            if ev_code == 116 || ev_code == 102 {
-                                exit_f.store(true, Ordering::SeqCst);
-                                action_f.store(ACTION_EXIT, Ordering::SeqCst);
-                                break;
-                            }
-                            // BTN_TOUCH = 330 (toque en pantalla; las coordenadas se evalúan en EV_SYN)
-                            if ev_code == 330 {
-                                touch_down_in_frame = true;
-                            }
+                        // EV_KEY = 1, BTN_TOUCH = 330 (toque en pantalla; las coordenadas se evalúan en EV_SYN)
+                        if ev_type == 1 && ev_value == 1 && ev_code == 330 {
+                            touch_down_in_frame = true;
                         }
 
                         // EV_SYN = 0, SYN_REPORT = 0 (fin de trama: current_x y current_y ya están actualizados)
@@ -272,19 +364,27 @@ fn listen_kindle_all_inputs(
                                     UserAction::Exit => {
                                         exit_f.store(true, Ordering::SeqCst);
                                         action_f.store(ACTION_EXIT, Ordering::SeqCst);
+                                        notify_waiters(&notify);
                                         break;
                                     }
                                     UserAction::PagePrev => {
                                         action_f.store(ACTION_PAGE_PREV, Ordering::SeqCst);
+                                        notify_waiters(&notify);
                                     }
                                     UserAction::PageNext => {
                                         action_f.store(ACTION_PAGE_NEXT, Ordering::SeqCst);
+                                        notify_waiters(&notify);
                                     }
                                 }
                             }
                         }
                     } else {
-                        thread::sleep(Duration::from_millis(50));
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        if consecutive_errors >= 3 {
+                            // Dispositivo no legible o desconectado: terminar el hilo para no ciclar CPU
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(200));
                     }
                 }
             });
