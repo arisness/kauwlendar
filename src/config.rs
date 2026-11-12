@@ -46,6 +46,23 @@ impl fmt::Display for Language {
     }
 }
 
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DashboardView {
+    #[default]
+    Timeline,
+    Cards,
+}
+
+impl fmt::Display for DashboardView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DashboardView::Timeline => write!(f, "timeline"),
+            DashboardView::Cards => write!(f, "cards"),
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     #[serde(default = "default_refresh_minutes")]
@@ -59,6 +76,9 @@ pub struct Config {
 
     #[serde(default)]
     pub language: Language,
+
+    #[serde(default)]
+    pub view: DashboardView,
 
     #[serde(default)]
     pub calendars: Vec<CalendarSource>,
@@ -202,6 +222,7 @@ mod tests {
         assert_eq!(cfg.utc_offset_hours, -4);
         assert_eq!(cfg.time_format, TimeFormat::H12);
         assert_eq!(cfg.language, Language::En); // Default is En
+        assert_eq!(cfg.view, DashboardView::Timeline); // Default is Timeline
         assert_eq!(cfg.calendars.len(), 1);
         assert_eq!(cfg.calendars[0].name, "Personal");
         assert!(cfg.validate().is_ok());
@@ -211,12 +232,14 @@ mod tests {
     fn test_parse_language_english() {
         let toml_data = r#"
             language = "en"
+            view = "cards"
             [[calendars]]
             name = "Work"
             url = "https://outlook.com/test.ics"
         "#;
         let cfg: Config = toml::from_str(toml_data).expect("Valid config");
         assert_eq!(cfg.language, Language::En);
+        assert_eq!(cfg.view, DashboardView::Cards);
     }
 
     #[test]

@@ -17,6 +17,11 @@ time_format = "12h"
 # "es" -> Spanish: [ SALIR ], "Lunes, 09 de Noviembre de 2026", "Todo el día"
 language = "en"
 
+# Screen view layout:
+# "timeline" -> Google Calendar-style vertical day schedule with hour axis and proportional blocks (default)
+# "cards"    -> Agenda cards view (Big Agenda Cards)
+view = "timeline"
+
 # Calendar list (you can add multiple [[calendars]] blocks)
 # In Google Calendar: Calendar Settings -> "Secret address in iCal format"
 [[calendars]]
