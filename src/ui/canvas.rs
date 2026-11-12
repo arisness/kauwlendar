@@ -106,6 +106,25 @@ impl Canvas {
         self.draw_rect_fill(x, y, length, thickness, color);
     }
 
+    pub fn draw_line_v(&mut self, x: u32, y: u32, length: u32, thickness: u32, color: u8) {
+        self.draw_rect_fill(x, y, thickness, length, color);
+    }
+
+    pub fn draw_circle_fill(&mut self, cx: i32, cy: i32, radius: i32, color: u8) {
+        let r_sq = radius * radius;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx * dx + dy * dy <= r_sq {
+                    let px = cx + dx;
+                    let py = cy + dy;
+                    if px >= 0 && px < self.width as i32 && py >= 0 && py < self.height as i32 {
+                        self.img.put_pixel(px as u32, py as u32, Luma([color]));
+                    }
+                }
+            }
+        }
+    }
+
     pub fn draw_text<F: Font>(&mut self, font: &F, text: &str, x: i32, y: i32, scale_px: f32, color: u8) {
         let scaled_font = font.as_scaled(PxScale::from(scale_px));
         let mut caret = Point {
