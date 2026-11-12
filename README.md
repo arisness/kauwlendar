@@ -8,10 +8,15 @@ Kauwlendar turns your Kindle into an elegant, low-power, high-contrast daily age
 
 ## Features
 
-* **Big Agenda Cards design:**
-  * High-contrast dark header featuring a large clock (92px), localized date in Spanish, and battery level pill badge.
-  * Enlarged event cards (195px–240px) with 48px bold titles, time range pills (`09:00 AM - 10:30 AM` or `Todo el día`), and calendar category pills (`Personal`, `Trabajo`).
-  * Minimalist footer with no visual clutter.
+* **Multiple dashboard layouts (`view = "timeline"` or `view = "cards"`):**
+  * **Timeline View (Google Calendar style, default):**
+    * Full daily schedule with an adaptive vertical time axis (defaulting to 06:00–23:00 and expanding dynamically for early morning or late night events).
+    * Proportional duration blocks with clean e-ink borders and distinct highlighting for the currently active event.
+    * Automatic horizontal column allocation for concurrent or overlapping events.
+    * Solid horizontal "Current Time" indicator line with an axis dot marking the present moment.
+    * Pinned compact bar at the top for all-day events.
+  * **Big Agenda Cards layout:**
+    * Enlarged 4-card sliding window (195px cards) with 48px bold titles, time pills, category badges, and buttonless touch pagination.
 * **KPM / Scriptlets integration (Library book cover):**
   * Launches like a native book directly from the Kindle library using `Kauwlendar.sh` in `/mnt/us/documents/` and a custom book cover `icon.png` (250x391 px).
   * No need to open KUAL manually: start it with a single tap from the home screen.
@@ -42,6 +47,36 @@ Kauwlendar turns your Kindle into an elegant, low-power, high-contrast daily age
 
 When running, Kauwlendar renders a high-contrast layout tailored to the native resolution of the Kindle (1072 x 1448 px on Paperwhite, adaptive to other models):
 
+### Timeline View (Google Calendar Style)
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│  Sunday, November 08, 2026                     [85%]        [ EXIT ]   │
+│  04:37 PM                                                              │
+├────────────────────────────────────────────────────────────────────────┤
+│  [ ALL DAY ]  All-Day Event                                            │
+├──────┬─────────────────────────────────────────────────────────────────┤
+│ 06 AM│ ╭─────────────────────────────────────────────────────────────╮ │
+│      │ │ Event 1 • Work (06:00 AM - 07:45 AM)                        │ │
+│ 08 AM│ ╰─────────────────────────────────────────────────────────────╯ │
+│ 09 AM│ ╭──────────────────────────────╮                                │
+│      │ │ Event 2 (09:00 - 09:30)      │                                │
+│ 10 AM│ ╰──────────────────────────────╯ ╭────────────────────────────╮ │
+│      │ ╭──────────────────────────────╮ │ Event 4                    │ │
+│      │ │ Event 3                      │ │ (10:00 AM - 06:00 PM)      │ │
+│ 12 PM│ ╰──────────────────────────────╯ │                            │ │
+│ 02 PM│                                  │                            │ │
+│ 04 PM│ ●────────────────────────────────┼────────────────────────────┤ │ <-- Current Time
+│      │                                  ╰────────────────────────────╯ │
+│ 06 PM│                                                                 │
+│ 08 PM│ ╭─────────────────────────────────────────────────────────────╮ │
+│      │ │ Event 5 (08:00 PM - 09:30 PM)                               │ │
+│ 10 PM│ ╰─────────────────────────────────────────────────────────────╯ │
+└──────┴─────────────────────────────────────────────────────────────────┘
+```
+
+### Big Agenda Cards View
+
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
 │  Monday, November 09, 2026                    [85%]        [ EXIT ]    │
@@ -58,13 +93,8 @@ When running, Kauwlendar renders a high-contrast layout tailored to the native r
 │  │ Event 1                                                          │  │
 │  ╰──────────────────────────────────────────────────────────────────╯  │
 │                                                                        │
-│  ╭──────────────────────────────────────────────────────────────────╮  │
-│  │ [ 02:15 PM - 03:00 PM ]  [ Personal ]                            │  │
-│  │ Event 2                                                          │  │
-│  ╰──────────────────────────────────────────────────────────────────╯  │
-│                                                                        │
 ├────────────────────────────────────────────────────────────────────────┤
-│                    Tap [EXIT] to return to Kindle                      │
+│  ‹ Prev                          Page 1 of 2                    Next › │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 

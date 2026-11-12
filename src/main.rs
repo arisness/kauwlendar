@@ -5,7 +5,7 @@ mod ui;
 
 use calendar::{calculate_initial_start_index, fetch_all_calendars};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Timelike, Utc};
-use config::{Config, Language};
+use config::{Config, DashboardView, Language};
 use platform::{
     get_battery_percent, is_kindle, set_wifi, wait_for_network, InputController, KindleGuard,
     UserAction,
@@ -15,7 +15,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::panic;
 use std::process::{Command, Stdio};
-use ui::screens::{render_dashboard, render_error_screen};
+use ui::screens::{render_dashboard, render_error_screen, render_timeline_dashboard};
 use ui::Canvas;
 
 /// Registra mensajes en consola cuando se ejecuta en PC, y en `/tmp/kauwlendar.log` en Kindle
@@ -202,15 +202,29 @@ fn main() {
         }
 
         let battery = get_battery_percent().or(initial_battery);
-        render_dashboard(
-            &mut canvas,
-            &now,
-            &cached_events,
-            current_start,
-            config.time_format,
-            battery,
-            config.language,
-        );
+        match config.view {
+            DashboardView::Timeline => {
+                render_timeline_dashboard(
+                    &mut canvas,
+                    &now,
+                    &cached_events,
+                    config.time_format,
+                    battery,
+                    config.language,
+                );
+            }
+            DashboardView::Cards => {
+                render_dashboard(
+                    &mut canvas,
+                    &now,
+                    &cached_events,
+                    current_start,
+                    config.time_format,
+                    battery,
+                    config.language,
+                );
+            }
+        }
 
         guard.pause_ui();
         if let Err(e) = canvas.render_to_screen() {
