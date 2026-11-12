@@ -34,26 +34,42 @@ fn run_quiet(cmd: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeepSleepOutcome {
+    TimerExpired,
+    UserWakeup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeepSleepReport {
+    pub outcome: DeepSleepOutcome,
+    pub mode: &'static str,
+    pub sys_elapsed_ms: u64,
+    pub rtc_elapsed_ms: u64,
+}
+
 pub struct KindleGuard {
     active: bool,
     pub initial_wifi: bool,
+    pub initial_frontlight: Option<u32>,
 }
 
 impl KindleGuard {
     pub fn new() -> Self {
         let is_k = is_kindle();
-        let initial_wifi = if is_k {
-            get_wifi_state()
-        } else {
-            true
-        };
+        let initial_wifi = if is_k { get_wifi_state() } else { true };
+        let initial_frontlight = if is_k { get_frontlight_level() } else { None };
         if is_k {
             // Evitar que powerd active el salvapantallas sin matar el servicio powerd
-            run_quiet("lipc-set-prop", &["com.lab126.powerd", "preventScreenSaver", "1"]);
+            run_quiet(
+                "lipc-set-prop",
+                &["com.lab126.powerd", "preventScreenSaver", "1"],
+            );
         }
         Self {
             active: is_k,
             initial_wifi,
+            initial_frontlight,
         }
     }
 
@@ -67,20 +83,35 @@ impl KindleGuard {
         }
     }
 
+    /// Apaga los LEDs de la luz frontal (Frontlight) para ahorrar batería en modo cuadro/descanso
+    pub fn disable_frontlight(&self) {
+        if self.active {
+            set_frontlight_level(0);
+        }
+    }
+
     pub fn restore(&mut self) {
         if self.active {
             // 1. Restaurar el estado original del Wi-Fi del Kindle
             set_wifi(self.initial_wifi);
 
-            // 2. Reanudar inmediatamente los procesos de la interfaz gráfica de Kindle
+            // 2. Restaurar el nivel original de luz frontal (Frontlight)
+            if let Some(level) = self.initial_frontlight {
+                set_frontlight_level(level);
+            }
+
+            // 3. Reanudar inmediatamente los procesos de la interfaz gráfica de Kindle
             for proc_name in &["cvm", "awesome", "mesquite"] {
                 run_quiet("killall", &["-CONT", proc_name]);
             }
 
-            // 3. Restaurar el comportamiento normal del salvapantallas en powerd
-            run_quiet("lipc-set-prop", &["com.lab126.powerd", "preventScreenSaver", "0"]);
+            // 4. Restaurar el comportamiento normal del salvapantallas en powerd
+            run_quiet(
+                "lipc-set-prop",
+                &["com.lab126.powerd", "preventScreenSaver", "0"],
+            );
 
-            // 4. Limpiar el framebuffer con refresco completo para que la UI de Kindle se repinte limpia
+            // 5. Limpiar el framebuffer con refresco completo para que la UI de Kindle se repinte limpia
             let fbink = find_fbink_bin();
             if !run_quiet(fbink, &["-q", "-c", "-f"]) {
                 for eips in &["/usr/sbin/eips", "/usr/bin/eips", "eips"] {
@@ -209,6 +240,53 @@ pub fn get_screen_dimensions() -> (u32, u32) {
     (1072, 1448)
 }
 
+pub fn get_frontlight_level() -> Option<u32> {
+    if is_kindle() {
+        if let Ok(out) = Command::new("lipc-get-prop")
+            .args(["com.lab126.powerd", "flIntensity"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Ok(val) = text.trim().parse::<u32>() {
+                return Some(val);
+            }
+        }
+        if let Ok(entries) = fs::read_dir("/sys/class/backlight") {
+            for entry in entries.flatten() {
+                let b_path = entry.path().join("brightness");
+                if let Ok(content) = fs::read_to_string(b_path) {
+                    if let Ok(val) = content.trim().parse::<u32>() {
+                        return Some(val);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn set_frontlight_level(level: u32) {
+    if is_kindle() {
+        let val = level.to_string();
+        run_quiet(
+            "lipc-set-prop",
+            &["-i", "com.lab126.powerd", "flIntensity", &val],
+        );
+        run_quiet(
+            "lipc-set-prop",
+            &["com.lab126.powerd", "flIntensity", &val],
+        );
+        if let Ok(entries) = fs::read_dir("/sys/class/backlight") {
+            for entry in entries.flatten() {
+                let b_path = entry.path().join("brightness");
+                if b_path.exists() {
+                    let _ = fs::write(b_path, &val);
+                }
+            }
+        }
+    }
+}
+
 pub fn get_wifi_state() -> bool {
     if is_kindle() {
         if let Ok(out) = Command::new("lipc-get-prop")
@@ -226,34 +304,26 @@ pub fn set_wifi(enable: bool) {
     if is_kindle() {
         let val = if enable { "1" } else { "0" };
 
+        if enable {
+            run_quiet("ifconfig", &["wlan0", "up"]);
+            run_quiet("ip", &["link", "set", "wlan0", "up"]);
+        }
+
         // Intentar con flag entera (-i) y sin ella para compatibilidad con todas las versiones de Kindle
-        let _ = Command::new("lipc-set-prop")
-            .args(["-i", "com.lab126.cmd", "wirelessEnable", val])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        run_quiet(
+            "lipc-set-prop",
+            &["-i", "com.lab126.cmd", "wirelessEnable", val],
+        );
+        run_quiet("lipc-set-prop", &["com.lab126.cmd", "wirelessEnable", val]);
+        run_quiet("lipc-set-prop", &["-i", "com.lab126.wifid", "enable", val]);
+        run_quiet("lipc-set-prop", &["com.lab126.wifid", "enable", val]);
 
-        let _ = Command::new("lipc-set-prop")
-            .args(["com.lab126.cmd", "wirelessEnable", val])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-
-        let _ = Command::new("lipc-set-prop")
-            .args(["-i", "com.lab126.wifid", "enable", val])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-
-        let _ = Command::new("lipc-set-prop")
-            .args(["com.lab126.wifid", "enable", val])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        if !enable {
+            // Forzar bajada a nivel de interfaz de red para apagar el radio físico de inmediato
+            run_quiet("ifconfig", &["wlan0", "down"]);
+            run_quiet("ip", &["link", "set", "wlan0", "down"]);
+            thread::sleep(Duration::from_millis(300));
+        }
     }
 }
 
@@ -341,31 +411,184 @@ pub fn get_battery_percent() -> Option<u32> {
     Some(100)
 }
 
-#[allow(dead_code)]
-pub fn sleep_with_rtcwake(seconds: i64) {
+const MIN_VALID_RTC_EPOCH_SECS: i64 = 1_577_836_800; // 2020-01-01T00:00:00Z
+
+/// Parsea segundos desde Unix epoch validando que no sea un RTC reiniciado (p. ej. 1969/1970).
+pub fn parse_rtc_epoch_secs(raw: &str) -> Option<i64> {
+    let parsed = raw.trim().parse::<i64>().ok()?;
+    if parsed > MIN_VALID_RTC_EPOCH_SECS {
+        Some(parsed)
+    } else {
+        None
+    }
+}
+
+/// Lee la hora UTC del hardware desde `/sys/class/rtc/rtc0/since_epoch` (`bd71827-rtc`).
+pub fn read_rtc0_epoch_secs() -> Option<i64> {
     if !is_kindle() {
-        println!("[DEV] Esperando {} segundos (modo PC)...", seconds);
-        thread::sleep(Duration::from_secs(seconds.max(1) as u64));
-        return;
+        return None;
+    }
+    let raw = fs::read_to_string("/sys/class/rtc/rtc0/since_epoch").ok()?;
+    parse_rtc_epoch_secs(&raw)
+}
+
+/// Resuelve la mejor hora UTC actual: si `CLOCK_REALTIME` quedó atrasado respecto al RTC hardware
+/// tras una suspensión, usa directamente `rtc0` cuando lo supera por más de 3 segundos.
+pub fn resolve_best_utc_now(
+    sys_now: chrono::DateTime<chrono::Utc>,
+    rtc_secs: Option<i64>,
+) -> chrono::DateTime<chrono::Utc> {
+    if let Some(rtc) = rtc_secs {
+        if rtc > sys_now.timestamp() + 3 {
+            if let Some(rtc_dt) = chrono::DateTime::from_timestamp(rtc, 0) {
+                return rtc_dt;
+            }
+        }
+    }
+    sys_now
+}
+
+/// Devuelve la hora UTC actual corrigiendo automáticamente cualquier desfase tras suspender en Kindle.
+pub fn current_utc_now() -> chrono::DateTime<chrono::Utc> {
+    resolve_best_utc_now(chrono::Utc::now(), read_rtc0_epoch_secs())
+}
+
+/// Calcula duración efectiva (ms), duración de `CLOCK_REALTIME` y duración del RTC hardware.
+pub fn select_elapsed_ms(
+    sys_before_ms: i64,
+    sys_after_ms: i64,
+    rtc_before_secs: Option<i64>,
+    rtc_after_secs: Option<i64>,
+) -> (u64, u64, u64) {
+    let sys_elapsed_ms = (sys_after_ms - sys_before_ms).max(0) as u64;
+    let rtc_elapsed_ms = match (rtc_before_secs, rtc_after_secs) {
+        (Some(before), Some(after)) if after >= before => ((after - before) as u64) * 1000,
+        _ => 0,
+    };
+    let effective_ms = sys_elapsed_ms.max(rtc_elapsed_ms);
+    (effective_ms, sys_elapsed_ms, rtc_elapsed_ms)
+}
+
+/// Entra en suspensión `standby` programando directamente `/sys/class/rtc/rtc0/wakealarm` en UTC.
+/// No modifica el gobernador `cpufreq` (evita bloqueos del PMIC en SoC i.MX).
+/// - Si la alarma `rtc0` se cumple: retorna `DeepSleepOutcome::TimerExpired` para refrescar la vista.
+/// - Si el usuario pulsa el botón físico de encendido antes de que venza la alarma: el hardware
+///   despierta anticipadamente y retorna `DeepSleepOutcome::UserWakeup` para salir de inmediato.
+pub fn enter_deep_sleep(
+    seconds: u64,
+    input: &crate::platform::InputController,
+) -> DeepSleepReport {
+    if input.is_exit_requested() {
+        return DeepSleepReport {
+            outcome: DeepSleepOutcome::UserWakeup,
+            mode: "pre-exit",
+            sys_elapsed_ms: 0,
+            rtc_elapsed_ms: 0,
+        };
+    }
+    if seconds == 0 {
+        return DeepSleepReport {
+            outcome: DeepSleepOutcome::TimerExpired,
+            mode: "none",
+            sys_elapsed_ms: 0,
+            rtc_elapsed_ms: 0,
+        };
     }
 
+    if !is_kindle() {
+        let before_ms = chrono::Utc::now().timestamp_millis();
+        let outcome = match input.wait_for_action_or_timeout(seconds) {
+            Some(crate::platform::UserAction::Exit) => DeepSleepOutcome::UserWakeup,
+            _ => DeepSleepOutcome::TimerExpired,
+        };
+        let elapsed_ms = (chrono::Utc::now().timestamp_millis() - before_ms).max(0) as u64;
+        return DeepSleepReport {
+            outcome,
+            mode: "condvar",
+            sys_elapsed_ms: elapsed_ms,
+            rtc_elapsed_ms: 0,
+        };
+    }
+
+    let wakealarm_path = "/sys/class/rtc/rtc0/wakealarm";
     let _ = fs::write("/sys/class/rtc/rtc0/device/power/wakeup", "enabled");
-    let _ = fs::write("/sys/class/rtc/rtc1/device/power/wakeup", "enabled");
 
-    let sec_str = seconds.to_string();
+    let target_ms = seconds * 1000;
+    let mut entered_suspend = false;
+    let mut elapsed_ms: u64 = 0;
+    let mut sys_elapsed_ms: u64 = 0;
+    let mut rtc_elapsed_ms: u64 = 0;
+    let mut used_mode: &'static str = "none";
 
-    let status_rtc0 = Command::new("rtcwake")
-        .args(["-d", "rtc0", "-m", "mem", "-s", &sec_str])
-        .status();
-
-    if status_rtc0.map(|s| !s.success()).unwrap_or(true) {
-        let status_rtc1 = Command::new("rtcwake")
-            .args(["-d", "rtc1", "-m", "mem", "-s", &sec_str])
-            .status();
-
-        if status_rtc1.map(|s| !s.success()).unwrap_or(true) {
-            thread::sleep(Duration::from_secs(seconds as u64));
+    let _ = fs::write(wakealarm_path, "0");
+    if fs::write(wakealarm_path, format!("+{}", seconds)).is_ok() {
+        let before_rtc = read_rtc0_epoch_secs();
+        let before_ms = chrono::Utc::now().timestamp_millis();
+        if fs::write("/sys/power/state", "standby").is_ok() {
+            let after_rtc = read_rtc0_epoch_secs();
+            let after_ms = chrono::Utc::now().timestamp_millis();
+            (elapsed_ms, sys_elapsed_ms, rtc_elapsed_ms) =
+                select_elapsed_ms(before_ms, after_ms, before_rtc, after_rtc);
+            if elapsed_ms >= 250 {
+                entered_suspend = true;
+                used_mode = "standby";
+            }
         }
+        let _ = fs::write(wakealarm_path, "0");
+    }
+
+    // Breve margen para procesar cualquier evento evdev pendiente al despertar
+    thread::sleep(Duration::from_millis(120));
+
+    if input.is_exit_requested() {
+        return DeepSleepReport {
+            outcome: DeepSleepOutcome::UserWakeup,
+            mode: used_mode,
+            sys_elapsed_ms,
+            rtc_elapsed_ms,
+        };
+    }
+
+    // Si entró en `standby` y despertó antes de que venciera la alarma de rtc0,
+    // fue despertado por la interrupción física del botón de encendido -> salir de una vez.
+    if entered_suspend && elapsed_ms + 2500 < target_ms {
+        return DeepSleepReport {
+            outcome: DeepSleepOutcome::UserWakeup,
+            mode: used_mode,
+            sys_elapsed_ms,
+            rtc_elapsed_ms,
+        };
+    }
+
+    // Si algún wakelock temporal (ej. cable USB conectado a la PC) impidió entrar en suspensión,
+    // esperar el resto del ciclo con Condvar (0% CPU) manteniendo el táctil y botón activos.
+    if !entered_suspend {
+        used_mode = "condvar";
+        let remaining = seconds.saturating_sub(elapsed_ms / 1000);
+        if remaining > 0 {
+            if let Some(crate::platform::UserAction::Exit) =
+                input.wait_for_action_or_timeout(remaining)
+            {
+                return DeepSleepReport {
+                    outcome: DeepSleepOutcome::UserWakeup,
+                    mode: used_mode,
+                    sys_elapsed_ms,
+                    rtc_elapsed_ms,
+                };
+            }
+        }
+    }
+
+    let outcome = if input.is_exit_requested() {
+        DeepSleepOutcome::UserWakeup
+    } else {
+        DeepSleepOutcome::TimerExpired
+    };
+    DeepSleepReport {
+        outcome,
+        mode: used_mode,
+        sys_elapsed_ms,
+        rtc_elapsed_ms,
     }
 }
 
@@ -391,5 +614,38 @@ mod tests {
     fn test_parse_fbink_eval_dimensions() {
         let sample = "isKindle=1;deviceName=\"Paperwhite\";viewWidth=1236;viewHeight=1648;screenWidth=1236;screenHeight=1648;";
         assert_eq!(parse_fbink_eval_dimensions(sample), Some((1236, 1648)));
+    }
+
+    #[test]
+    fn test_parse_rtc_epoch_secs_filters_1969_and_empty() {
+        assert_eq!(parse_rtc_epoch_secs(""), None);
+        assert_eq!(parse_rtc_epoch_secs("0\n"), None);
+        assert_eq!(parse_rtc_epoch_secs("3600\n"), None);
+        assert_eq!(parse_rtc_epoch_secs("1794500000\n"), Some(1_794_500_000));
+    }
+
+    #[test]
+    fn test_resolve_best_utc_now_corrects_stalled_clock() {
+        let sys_now = chrono::DateTime::from_timestamp(1_794_500_000, 0).unwrap();
+        // Normal jitter (<= 3s) preserves sys_now
+        assert_eq!(resolve_best_utc_now(sys_now, Some(1_794_500_002)), sys_now);
+        // Stalled kernel clock (> 3s behind rtc0) uses rtc0
+        let expected_rtc = chrono::DateTime::from_timestamp(1_794_501_800, 0).unwrap();
+        assert_eq!(
+            resolve_best_utc_now(sys_now, Some(1_794_501_800)),
+            expected_rtc
+        );
+    }
+
+    #[test]
+    fn test_select_elapsed_ms_uses_rtc_fallback_when_sys_clock_stalls() {
+        assert_eq!(
+            select_elapsed_ms(10_000, 10_150, Some(1_794_500_000), Some(1_794_501_800)),
+            (1_800_000, 150, 1_800_000)
+        );
+        assert_eq!(
+            select_elapsed_ms(10_000, 20_500, Some(1_794_500_000), Some(1_794_500_010)),
+            (10_500, 10_500, 10_000)
+        );
     }
 }

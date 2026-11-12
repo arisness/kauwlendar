@@ -11,7 +11,7 @@ exec >/tmp/kauwlendar.log 2>&1
 
 cleanup() {
     # Reanudar la interfaz gráfica de Kindle sin reiniciar el framework
-    killall -CONT cvm awesome mesquite 2>/dev/null
+    killall -CONT blanket cvm awesome mesquite 2>/dev/null
     lipc-set-prop com.lab126.powerd preventScreenSaver 0 2>/dev/null
     fbink -q -c -f 2>/dev/null || /usr/sbin/eips -c 2>/dev/null || eips -c 2>/dev/null
 }

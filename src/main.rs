@@ -4,11 +4,11 @@ mod platform;
 mod ui;
 
 use calendar::{calculate_initial_start_index, fetch_all_calendars};
-use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Timelike};
 use config::{Config, DashboardView, Language};
 use platform::{
-    get_battery_percent, is_kindle, set_wifi, wait_for_network, InputController, KindleGuard,
-    UserAction,
+    current_utc_now, enter_deep_sleep, get_battery_percent, is_kindle, set_wifi,
+    wait_for_network, DeepSleepOutcome, InputController, KindleGuard, UserAction,
 };
 use std::env;
 use std::fs::OpenOptions;
@@ -87,6 +87,7 @@ fn main() {
     let mut last_sync_date: Option<NaiveDate> = None;
     let mut cached_events: Vec<calendar::CalendarEvent> = Vec::new();
     let mut current_start: usize = 0;
+    let mut interactive_awake: bool = true;
 
     'main_loop: loop {
         if input.is_exit_requested() {
@@ -128,7 +129,7 @@ fn main() {
 
         let offset = FixedOffset::east_opt(config.utc_offset_hours * 3600)
             .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
-        let now = Utc::now().with_timezone(&offset);
+        let now = current_utc_now().with_timezone(&offset);
         let today = now.date_naive();
 
         // 4. Sincronización inteligente de Wi-Fi:
@@ -241,39 +242,48 @@ fn main() {
             break 'main_loop;
         }
 
-        // 5. Activar escucha táctil:
-        // - Esquina superior derecha: Botón [SALIR]
-        // - Debajo de la cabecera (mitad izq / der): Paginación de eventos (sin botones)
+        // 5. Fase de espera inteligente (Ventana inicial de 15s + Suspensión standby con rtc0/wakealarm):
+        // - Al recién entrar (o tras paginar), espera 15 segundos activos antes de suspender.
+        // - Luego apaga el frontlight y entra en `standby` programando `/sys/class/rtc/rtc0/wakealarm`.
+        // - Si vence el temporizador (`refresh_minutes`), despierta solo, actualiza la hora/vista y vuelve a dormir.
+        // - Si presionas el botón físico de encendido en cualquier momento, despierta de `standby` y sale de una vez.
         input.arm(false);
 
         let sleep_secs = calculate_sleep_seconds(&now, config.refresh_minutes);
+        let total_sleep = sleep_secs.max(5) as u64;
+        let awake_window = if interactive_awake {
+            15.min(total_sleep)
+        } else {
+            2.min(total_sleep)
+        };
+
         app_log(&format!(
-            "[INFO] Pantalla activa (toca [SALIR] para cerrar). Próxima actualización en {} minutos ({} segundos)...",
-            sleep_secs / 60,
-            sleep_secs
+            "[INFO] Ventana activa por {}s (luego standby RTC). Próxima actualización en {} minutos ({} segundos)...",
+            awake_window,
+            total_sleep / 60,
+            total_sleep
         ));
 
         let start_wait = std::time::Instant::now();
-        let total_sleep = sleep_secs as u64;
+        let mut enter_deep = true;
 
         loop {
             let elapsed = start_wait.elapsed().as_secs();
-            if elapsed >= total_sleep {
-                // Timeout cumplido: actualizar el índice activo para centrar el evento actual
-                let cur_mins = (now.hour() * 60 + now.minute()) as i32;
-                current_start = calculate_initial_start_index(&cached_events, cur_mins);
+            if elapsed >= awake_window {
                 break;
             }
 
-            let remaining = total_sleep - elapsed;
-            match input.wait_for_action_or_timeout(remaining) {
+            let remaining_awake = awake_window - elapsed;
+            match input.wait_for_action_or_timeout(remaining_awake) {
                 Some(UserAction::Exit) => {
-                    app_log("[INFO] Toque en [SALIR] detectado. Volviendo al menú de Kindle...");
+                    app_log("[INFO] Salida detectada. Volviendo al menú de Kindle...");
                     break 'main_loop;
                 }
                 Some(UserAction::PagePrev) => {
                     if current_start > 0 {
                         current_start = current_start.saturating_sub(4);
+                        interactive_awake = true;
+                        enter_deep = false;
                         app_log(&format!(
                             "[INFO] Navegando a eventos anteriores (índice inicio: {})",
                             current_start
@@ -288,6 +298,8 @@ fn main() {
                     let max_start = total.saturating_sub(4);
                     if current_start < max_start {
                         current_start = (current_start + 4).min(max_start);
+                        interactive_awake = true;
+                        enter_deep = false;
                         app_log(&format!(
                             "[INFO] Navegando a eventos siguientes (índice inicio: {})",
                             current_start
@@ -298,13 +310,50 @@ fn main() {
                     }
                 }
                 None => {
-                    // Timeout cumplido
-                    let cur_mins = (now.hour() * 60 + now.minute()) as i32;
-                    current_start = calculate_initial_start_index(&cached_events, cur_mins);
                     break;
                 }
             }
         }
+
+        if !enter_deep {
+            continue 'main_loop;
+        }
+
+        let elapsed_awake = start_wait.elapsed().as_secs();
+        let deep_sleep_secs = total_sleep.saturating_sub(elapsed_awake);
+
+        if deep_sleep_secs > 0 {
+            app_log(&format!(
+                "[INFO] Entrando en standby (rtc0/wakealarm) por {} segundos. Pulsa el botón físico para salir.",
+                deep_sleep_secs
+            ));
+            guard.disable_frontlight();
+
+            let sleep_report = enter_deep_sleep(deep_sleep_secs, &input);
+            app_log(&format!(
+                "[INFO] Retorno de standby: modo={}, sys={}ms, rtc={}ms, salida={:?}",
+                sleep_report.mode,
+                sleep_report.sys_elapsed_ms,
+                sleep_report.rtc_elapsed_ms,
+                sleep_report.outcome
+            ));
+            match sleep_report.outcome {
+                DeepSleepOutcome::UserWakeup => {
+                    app_log("[INFO] Botón físico detectado. Saliendo de inmediato al Kindle...");
+                    break 'main_loop;
+                }
+                DeepSleepOutcome::TimerExpired => {
+                    app_log("[INFO] Alarma RTC cumplida. Actualizando vista del calendario...");
+                    interactive_awake = false;
+                }
+            }
+        } else {
+            interactive_awake = false;
+        }
+
+        let refreshed_now = current_utc_now().with_timezone(&offset);
+        let cur_mins = (refreshed_now.hour() * 60 + refreshed_now.minute()) as i32;
+        current_start = calculate_initial_start_index(&cached_events, cur_mins);
     }
 
     guard.restore();
