@@ -3,6 +3,7 @@ use crate::config::{Language, TimeFormat};
 use crate::ui::canvas::{Canvas, COLOR_BLACK, COLOR_DARK_GRAY, COLOR_LIGHT_GRAY, COLOR_WHITE};
 use crate::ui::fonts::{font_bold, font_regular};
 use crate::ui::i18n::get_translations;
+use ab_glyph::Font;
 use chrono::{DateTime, FixedOffset, Timelike};
 
 /// Renderiza la vista de cronograma diario (Timeline View estilo Google Calendar)
@@ -20,51 +21,51 @@ pub fn render_timeline_dashboard(
     let reg = font_regular();
     let i18n = get_translations(lang);
 
-    let scale = canvas.width as f32 / 1072.0;
-    let margin = (36.0 * scale).round() as u32;
+    let scale = (canvas.width as f32 / 1072.0).clamp(0.6, 1.4);
+    let margin = (42.0 * scale).round() as u32;
     let content_w = canvas.width.saturating_sub(2 * margin);
 
     // =========================================================================
-    // 1. ENCABEZADO SUPERIOR (Fecha, Reloj, Batería y Botón Salir)
+    // 1. ENCABEZADO SUPERIOR (Fecha, Reloj, Batería y Botón Salir — tamaños como en cards)
     // =========================================================================
-    let header_h = (175.0 * scale).round() as u32;
+    let header_h = (210.0 * scale).round() as u32;
 
-    // Fila 1: Fecha completa
+    // Fila 1: Fecha completa (ancho completo superior sin colisionar con controles)
     let date_str = (i18n.format_date)(now);
-    let date_sz = (25.0 * scale).round();
-    canvas.draw_text(&bold, &date_str, margin as i32, (38.0 * scale) as i32, date_sz, COLOR_BLACK);
+    let date_sz = (42.0 * scale).round();
+    canvas.draw_text(&bold, &date_str, margin as i32, (22.0 * scale) as i32, date_sz, COLOR_BLACK);
 
     // Fila 2: Reloj grande
     let time_str = format_current_time(now, time_format);
-    let time_sz = (86.0 * scale).round();
-    let clock_y = (78.0 * scale) as i32;
+    let time_sz = (92.0 * scale).round();
+    let clock_y = (84.0 * scale) as i32;
     canvas.draw_text(&bold, &time_str, margin as i32, clock_y, time_sz, COLOR_BLACK);
 
     // Botón [ SALIR ] / [ EXIT ] en esquina superior derecha
-    let exit_w = (175.0 * scale).round() as u32;
-    let exit_h = (58.0 * scale).round() as u32;
+    let exit_w = (220.0 * scale).round() as u32;
+    let exit_h = (88.0 * scale).round() as u32;
     let exit_x = canvas.width - margin - exit_w;
-    let exit_y = (45.0 * scale) as u32;
+    let exit_y = (78.0 * scale) as u32;
 
-    canvas.draw_rounded_rect_fill(exit_x, exit_y, exit_w, exit_h, 10, COLOR_BLACK);
+    canvas.draw_rounded_rect_fill(exit_x, exit_y, exit_w, exit_h, 14, COLOR_BLACK);
     let exit_text = i18n.exit_button;
-    let exit_sz = (28.0 * scale).round();
+    let exit_sz = (36.0 * scale).round();
     let (e_w, _) = Canvas::measure_text(&bold, exit_text, exit_sz);
     let e_text_x = exit_x as f32 + (exit_w as f32 - e_w) / 2.0;
     let e_text_y = exit_y as f32 + (exit_h as f32 - exit_sz) / 2.0;
     canvas.draw_text(&bold, exit_text, e_text_x as i32, e_text_y as i32, exit_sz, COLOR_WHITE);
 
-    // Indicador de Batería al lado izquierdo del botón [ SALIR ] (como en la vista anterior)
+    // Indicador de Batería al lado izquierdo del botón [ SALIR ]
     if let Some(batt) = battery_percent {
         let batt_str = format!("{}%", batt);
-        let batt_sz = (24.0 * scale).round();
+        let batt_sz = (42.0 * scale).round();
         let (b_w, _) = Canvas::measure_text(&bold, &batt_str, batt_sz);
-        let batt_w = (b_w + 32.0 * scale).round() as u32;
-        let batt_h = (48.0 * scale).round() as u32;
-        let batt_x = exit_x.saturating_sub(batt_w + (18.0 * scale) as u32);
+        let batt_w = (b_w + 36.0 * scale).round() as u32;
+        let batt_h = (70.0 * scale).round() as u32;
+        let batt_x = exit_x.saturating_sub(batt_w + (20.0 * scale) as u32);
         let batt_y = exit_y + (exit_h.saturating_sub(batt_h)) / 2;
 
-        canvas.draw_rounded_rect_fill(batt_x, batt_y, batt_w, batt_h, 8, COLOR_LIGHT_GRAY);
+        canvas.draw_rounded_rect_fill(batt_x, batt_y, batt_w, batt_h, 10, COLOR_LIGHT_GRAY);
         canvas.draw_rect_outline(batt_x, batt_y, batt_w, batt_h, 2, COLOR_DARK_GRAY);
         let b_text_x = batt_x as f32 + (batt_w as f32 - b_w) / 2.0;
         let b_text_y = batt_y as f32 + (batt_h as f32 - batt_sz) / 2.0;
@@ -74,36 +75,38 @@ pub fn render_timeline_dashboard(
     // Línea separadora del encabezado
     canvas.draw_line_h(margin, header_h, content_w, 2, COLOR_LIGHT_GRAY);
 
-    let mut current_y = header_h + (12.0 * scale) as u32;
+    let mut current_y = header_h + (14.0 * scale) as u32;
 
     // =========================================================================
-    // 2. SECCIÓN DE EVENTOS "TODO EL DÍA" (Compacta)
+    // 2. SECCIÓN DE EVENTOS "TODO EL DÍA"
     // =========================================================================
     let all_day_events: Vec<&CalendarEvent> = events.iter().filter(|e| e.is_all_day).collect();
     if !all_day_events.is_empty() {
-        let chip_h = (48.0 * scale).round() as u32;
-        let badge_sz = (20.0 * scale).round();
-        let title_sz = (22.0 * scale).round();
+        let chip_h = (74.0 * scale).round() as u32;
+        let badge_sz = (26.0 * scale).round();
+        let title_sz = (36.0 * scale).round();
 
         for ev in all_day_events.iter().take(2) {
-            canvas.draw_rounded_rect_fill(margin, current_y, content_w, chip_h, 8, COLOR_LIGHT_GRAY);
+            canvas.draw_rounded_rect_fill(margin, current_y, content_w, chip_h, 10, COLOR_LIGHT_GRAY);
             canvas.draw_rect_outline(margin, current_y, content_w, chip_h, 2, COLOR_DARK_GRAY);
 
-            // Badge TODO EL DÍA
-            let badge_w = (130.0 * scale).round() as u32;
-            let badge_box_h = chip_h.saturating_sub(10);
-            let badge_y = current_y + 5;
-            canvas.draw_rounded_rect_fill(margin + 6, badge_y, badge_w, badge_box_h, 6, COLOR_DARK_GRAY);
+            // Badge TODO EL DÍA con ancho dinámico
             let b_lbl = i18n.all_day_badge;
             let (lbl_w, _) = Canvas::measure_text(&bold, b_lbl, badge_sz);
-            let lbl_x = (margin + 6) as f32 + (badge_w as f32 - lbl_w) / 2.0;
+            let badge_w = ((lbl_w + 30.0 * scale).round() as u32).max((160.0 * scale).round() as u32);
+            let badge_pad = (6.0 * scale).round() as u32;
+            let badge_box_h = chip_h.saturating_sub(badge_pad * 2);
+            let badge_y = current_y + badge_pad;
+            canvas.draw_rounded_rect_fill(margin + badge_pad, badge_y, badge_w, badge_box_h, 8, COLOR_DARK_GRAY);
+            let lbl_x = (margin + badge_pad) as f32 + (badge_w as f32 - lbl_w) / 2.0;
             let lbl_y = badge_y as f32 + (badge_box_h as f32 - badge_sz) / 2.0;
             canvas.draw_text(&bold, b_lbl, lbl_x as i32, lbl_y as i32, badge_sz, COLOR_WHITE);
 
-            // Título del evento
-            let text_x = margin + badge_w + (20.0 * scale) as u32;
+            // Título del evento ajustado al ancho disponible
+            let text_x = margin + badge_pad + badge_w + (18.0 * scale) as u32;
+            let max_title_w = (margin + content_w).saturating_sub(text_x + (14.0 * scale) as u32) as f32;
             let title_y = current_y as f32 + (chip_h as f32 - title_sz) / 2.0;
-            let title = truncate_text(&ev.summary, 45);
+            let title = fit_text_to_width(&bold, &ev.summary, title_sz, max_title_w);
             canvas.draw_text(&bold, &title, text_x as i32, title_y as i32, title_sz, COLOR_BLACK);
 
             current_y += chip_h + (8.0 * scale) as u32;
@@ -140,7 +143,7 @@ pub fn render_timeline_dashboard(
     end_hour = end_hour.max(now_hour).clamp(start_hour + 10, 24);
 
     let total_hours = (end_hour - start_hour + 1).max(12) as f32;
-    let time_col_w = (100.0 * scale).round() as u32;
+    let time_col_w = (122.0 * scale).round() as u32;
 
     let grid_top = current_y + (8.0 * scale) as u32;
     let grid_bottom = canvas.height.saturating_sub((28.0 * scale) as u32);
@@ -152,7 +155,7 @@ pub fn render_timeline_dashboard(
     let event_area_w = content_w.saturating_sub(time_col_w);
 
     // Dibujar guías de horas y etiquetas temporales
-    let hour_sz = (21.0 * scale).round();
+    let hour_sz = (28.0 * scale).round();
     for h in start_hour..=end_hour {
         let hour_offset = (h - start_hour) as f32;
         let y_h = grid_top + (hour_offset * px_per_hour).round() as u32;
@@ -179,8 +182,10 @@ pub fn render_timeline_dashboard(
     let current_minutes = (now.hour() * 60 + now.minute()) as i32;
 
     // Renderizar bloques de eventos
-    let title_font_sz = (24.0 * scale).round();
-    let time_font_sz = (20.0 * scale).round();
+    let title_font_sz = (32.0 * scale).round();
+    let time_font_sz = (26.0 * scale).round();
+    let min_block_h = (56.0 * scale).round() as u32;
+    let two_line_min_h = (76.0 * scale).round() as u32;
 
     for layout in &event_layouts {
         let ev = layout.event;
@@ -192,7 +197,6 @@ pub fn render_timeline_dashboard(
 
         let b_top = grid_top + (start_offset_mins * px_per_minute).round() as u32;
         let b_bottom = grid_top + (end_offset_mins * px_per_minute).round() as u32;
-        let min_block_h = (52.0 * scale).round() as u32;
         let b_h = b_bottom.saturating_sub(b_top).max(min_block_h);
 
         // Distribución horizontal entre columnas en caso de superposición
@@ -216,22 +220,38 @@ pub fn render_timeline_dashboard(
         }
 
         // Textos dentro del bloque de evento
-        let text_pad_x = b_x + if is_active { (16.0 * scale) as u32 } else { (12.0 * scale) as u32 };
-        let mut text_cur_y = b_top + (10.0 * scale) as u32;
+        let left_inset = if is_active { (16.0 * scale) as u32 } else { (12.0 * scale) as u32 };
+        let right_inset = (12.0 * scale) as u32;
+        let text_pad_x = b_x + left_inset;
+        let max_text_w = b_w.saturating_sub(left_inset + right_inset) as f32;
 
-        // Fila 1: Título en negrita
-        let max_title_chars = (b_w as f32 / (title_font_sz * 0.58)).floor() as usize;
-        let title_text = truncate_text(&ev.summary, max_title_chars.max(10));
-        canvas.draw_text(&bold, &title_text, text_pad_x as i32, text_cur_y as i32, title_font_sz, COLOR_BLACK);
+        if b_h >= two_line_min_h {
+            // Dos filas: Título grande en negrita + Rango horario y calendario
+            let mut text_cur_y = b_top + (8.0 * scale) as u32;
+            let title_text = fit_text_to_width(&bold, &ev.summary, title_font_sz, max_text_w);
+            canvas.draw_text(&bold, &title_text, text_pad_x as i32, text_cur_y as i32, title_font_sz, COLOR_BLACK);
 
-        text_cur_y += title_font_sz as u32 + (4.0 * scale) as u32;
+            text_cur_y += title_font_sz as u32 + (4.0 * scale) as u32;
 
-        // Fila 2: Rango horario y nombre del calendario
-        if b_h >= (64.0 * scale) as u32 {
             let time_label = ev.time_label(time_format);
-            let cal_tag = format!("• {}", truncate_text(&ev.calendar_name, 12));
-            let meta_text = format!("{} {}", time_label, cal_tag);
+            let meta_full = if ev.calendar_name.trim().is_empty() {
+                time_label
+            } else {
+                format!("{} • {}", time_label, ev.calendar_name)
+            };
+            let meta_text = fit_text_to_width(&reg, &meta_full, time_font_sz, max_text_w);
             canvas.draw_text(&reg, &meta_text, text_pad_x as i32, text_cur_y as i32, time_font_sz, COLOR_DARK_GRAY);
+        } else {
+            // Bloque compacto de una fila centrado verticalmente
+            let time_label = ev.time_label(time_format);
+            let inline_candidate = format!("{} · {}", ev.summary, time_label);
+            let line_text = if Canvas::measure_text(&bold, &inline_candidate, title_font_sz).0 <= max_text_w {
+                inline_candidate
+            } else {
+                fit_text_to_width(&bold, &ev.summary, title_font_sz, max_text_w)
+            };
+            let text_y = b_top as f32 + (b_h as f32 - title_font_sz) / 2.0;
+            canvas.draw_text(&bold, &line_text, text_pad_x as i32, text_y as i32, title_font_sz, COLOR_BLACK);
         }
     }
 
@@ -255,22 +275,22 @@ pub fn render_timeline_dashboard(
     // 5. MENSAJE SI NO HAY EVENTOS EN TODO EL DÍA
     // =========================================================================
     if events.is_empty() {
-        let empty_box_h = (120.0 * scale).round() as u32;
+        let empty_box_h = (150.0 * scale).round() as u32;
         let empty_box_y = grid_top + (grid_height.saturating_sub(empty_box_h) / 2);
         canvas.draw_rounded_rect_fill(margin + time_col_w + 30, empty_box_y, event_area_w.saturating_sub(60), empty_box_h, 12, COLOR_LIGHT_GRAY);
         canvas.draw_rect_outline(margin + time_col_w + 30, empty_box_y, event_area_w.saturating_sub(60), empty_box_h, 2, COLOR_DARK_GRAY);
 
         let no_title = i18n.no_events_title;
-        let no_title_sz = (30.0 * scale).round();
+        let no_title_sz = (36.0 * scale).round();
         let (nt_w, _) = Canvas::measure_text(&bold, no_title, no_title_sz);
         let nt_x = (event_area_x as f32 + (event_area_w as f32 - nt_w) / 2.0).max(margin as f32);
-        canvas.draw_text(&bold, no_title, nt_x as i32, (empty_box_y + 25) as i32, no_title_sz, COLOR_BLACK);
+        canvas.draw_text(&bold, no_title, nt_x as i32, (empty_box_y + (28.0 * scale) as u32) as i32, no_title_sz, COLOR_BLACK);
 
         let no_sub = i18n.no_events_subtitle;
-        let no_sub_sz = (22.0 * scale).round();
+        let no_sub_sz = (26.0 * scale).round();
         let (ns_w, _) = Canvas::measure_text(&reg, no_sub, no_sub_sz);
         let ns_x = (event_area_x as f32 + (event_area_w as f32 - ns_w) / 2.0).max(margin as f32);
-        canvas.draw_text(&reg, no_sub, ns_x as i32, (empty_box_y + 65) as i32, no_sub_sz, COLOR_DARK_GRAY);
+        canvas.draw_text(&reg, no_sub, ns_x as i32, (empty_box_y + (84.0 * scale) as u32) as i32, no_sub_sz, COLOR_DARK_GRAY);
     }
 }
 
@@ -402,14 +422,24 @@ fn format_hour_label(hour: i32, format: TimeFormat) -> String {
     }
 }
 
-fn truncate_text(text: &str, max_chars: usize) -> String {
-    if text.chars().count() > max_chars {
-        let mut s: String = text.chars().take(max_chars.saturating_sub(3)).collect();
-        s.push_str("...");
-        s
-    } else {
-        text.to_string()
+fn fit_text_to_width<F: Font>(font: &F, text: &str, scale_px: f32, max_width: f32) -> String {
+    if max_width <= 0.0 {
+        return String::new();
     }
+    if Canvas::measure_text(font, text, scale_px).0 <= max_width {
+        return text.to_string();
+    }
+
+    let mut chars: Vec<char> = text.chars().collect();
+    while !chars.is_empty() {
+        chars.pop();
+        let mut candidate: String = chars.iter().collect();
+        candidate.push_str("...");
+        if Canvas::measure_text(font, &candidate, scale_px).0 <= max_width {
+            return candidate;
+        }
+    }
+    String::new()
 }
 
 #[cfg(test)]
