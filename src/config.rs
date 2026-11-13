@@ -63,6 +63,12 @@ impl fmt::Display for DashboardView {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NightSchedule {
+    pub start_minutes: u32,
+    pub end_minutes: u32,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     #[serde(default = "default_refresh_minutes")]
@@ -80,12 +86,60 @@ pub struct Config {
     #[serde(default)]
     pub view: DashboardView,
 
+    #[serde(default = "default_night_start")]
+    pub night_start: String,
+
+    #[serde(default = "default_night_end")]
+    pub night_end: String,
+
     #[serde(default)]
     pub calendars: Vec<CalendarSource>,
 }
 
 fn default_refresh_minutes() -> u32 {
     60
+}
+
+fn default_night_start() -> String {
+    "21:00".to_string()
+}
+
+fn default_night_end() -> String {
+    "06:00".to_string()
+}
+
+fn parse_hhmm_or_off(
+    field: &'static str,
+    raw: &str,
+) -> Result<Option<(u32, u32)>, ConfigError> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+
+    let mut parts = trimmed.split(':');
+    let (Some(h_str), Some(m_str), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(ConfigError::InvalidNightTime {
+            field,
+            value: raw.to_string(),
+        });
+    };
+
+    let (Ok(hour), Ok(minute)) = (h_str.parse::<u32>(), m_str.parse::<u32>()) else {
+        return Err(ConfigError::InvalidNightTime {
+            field,
+            value: raw.to_string(),
+        });
+    };
+
+    if hour > 23 || minute > 59 {
+        return Err(ConfigError::InvalidNightTime {
+            field,
+            value: raw.to_string(),
+        });
+    }
+
+    Ok(Some((hour, minute)))
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -101,6 +155,7 @@ pub enum ConfigError {
     ParseError(String),
     NoCalendarsConfigured,
     InvalidUrl { calendar_name: String, url: String },
+    InvalidNightTime { field: &'static str, value: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -123,6 +178,11 @@ impl fmt::Display for ConfigError {
                 f,
                 "URL inválida para el calendario '{}':\n{}\nDebe comenzar con http:// o https://",
                 calendar_name, url
+            ),
+            ConfigError::InvalidNightTime { field, value } => write!(
+                f,
+                "Horario nocturno inválido en '{}': '{}'\nUsa formato \"HH:MM\" (ej. \"21:00\") o \"off\" para actualizar 24h.",
+                field, value
             ),
         }
     }
@@ -179,6 +239,27 @@ impl Config {
         Ok((cfg, path))
     }
 
+    pub fn night_schedule(&self) -> Result<Option<NightSchedule>, ConfigError> {
+        let start = parse_hhmm_or_off("night_start", &self.night_start)?;
+        let end = parse_hhmm_or_off("night_end", &self.night_end)?;
+
+        match (start, end) {
+            (Some((sh, sm)), Some((eh, em))) => {
+                let start_minutes = sh * 60 + sm;
+                let end_minutes = eh * 60 + em;
+                if start_minutes == end_minutes {
+                    Ok(None)
+                } else {
+                    Ok(Some(NightSchedule {
+                        start_minutes,
+                        end_minutes,
+                    }))
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.calendars.is_empty() {
             return Err(ConfigError::NoCalendarsConfigured);
@@ -196,6 +277,8 @@ impl Config {
                 });
             }
         }
+
+        self.night_schedule()?;
 
         Ok(())
     }
@@ -223,6 +306,15 @@ mod tests {
         assert_eq!(cfg.time_format, TimeFormat::H12);
         assert_eq!(cfg.language, Language::En); // Default is En
         assert_eq!(cfg.view, DashboardView::Timeline); // Default is Timeline
+        assert_eq!(cfg.night_start, "21:00");
+        assert_eq!(cfg.night_end, "06:00");
+        assert_eq!(
+            cfg.night_schedule().expect("Valid night schedule"),
+            Some(NightSchedule {
+                start_minutes: 21 * 60,
+                end_minutes: 6 * 60,
+            })
+        );
         assert_eq!(cfg.calendars.len(), 1);
         assert_eq!(cfg.calendars[0].name, "Personal");
         assert!(cfg.validate().is_ok());
@@ -268,6 +360,54 @@ mod tests {
         assert!(matches!(
             cfg.validate(),
             Err(ConfigError::InvalidUrl { .. })
+        ));
+    }
+
+    #[test]
+    fn test_night_schedule_custom_and_off() {
+        let custom_toml = r#"
+            night_start = "22:30"
+            night_end = "06:45"
+            [[calendars]]
+            name = "Test"
+            url = "https://example.com/cal.ics"
+        "#;
+        let cfg: Config = toml::from_str(custom_toml).expect("Valid toml");
+        assert!(cfg.validate().is_ok());
+        assert_eq!(
+            cfg.night_schedule().unwrap(),
+            Some(NightSchedule {
+                start_minutes: 22 * 60 + 30,
+                end_minutes: 6 * 60 + 45,
+            })
+        );
+
+        let off_toml = r#"
+            night_start = "off"
+            [[calendars]]
+            name = "Test"
+            url = "https://example.com/cal.ics"
+        "#;
+        let cfg_off: Config = toml::from_str(off_toml).expect("Valid toml");
+        assert!(cfg_off.validate().is_ok());
+        assert_eq!(cfg_off.night_schedule().unwrap(), None);
+    }
+
+    #[test]
+    fn test_invalid_night_schedule_fails_validation() {
+        let bad_toml = r#"
+            night_start = "25:00"
+            [[calendars]]
+            name = "Test"
+            url = "https://example.com/cal.ics"
+        "#;
+        let cfg: Config = toml::from_str(bad_toml).expect("Valid toml");
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidNightTime {
+                field: "night_start",
+                ..
+            })
         ));
     }
 }

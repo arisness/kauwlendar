@@ -22,6 +22,12 @@ language = "en"
 # "cards"    -> Agenda cards view (Big Agenda Cards)
 view = "timeline"
 
+# Nighttime sleep schedule without updates ("HH:MM" in 24h format, or "off" for 24h updates):
+# night_start -> Time to enter continuous mem suspend until night_end (default "21:00")
+# night_end   -> Time to wake up, sync calendars, and resume updates (default "06:00")
+night_start = "21:00"
+night_end = "06:00"
+
 # Calendar list (you can add multiple [[calendars]] blocks)
 # In Google Calendar: Calendar Settings -> "Secret address in iCal format"
 [[calendars]]

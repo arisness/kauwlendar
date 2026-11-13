@@ -5,7 +5,7 @@ mod ui;
 
 use calendar::{calculate_initial_start_index, fetch_all_calendars};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Timelike};
-use config::{Config, DashboardView, Language};
+use config::{Config, DashboardView, Language, NightSchedule};
 use platform::{
     current_utc_now, enter_deep_sleep, get_battery_percent, is_kindle, set_wifi,
     wait_for_network, DeepSleepOutcome, InputController, KindleGuard, UserAction,
@@ -131,11 +131,14 @@ fn main() {
             .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
         let now = current_utc_now().with_timezone(&offset);
         let today = now.date_naive();
+        let night_schedule = config.night_schedule().unwrap_or(None);
 
         // 4. Sincronización inteligente de Wi-Fi:
-        // Solo conecta al ENTRAR a la app o a partir de las 6:00 AM si cambió de día.
+        // Solo conecta al ENTRAR a la app o al despertar de la franja nocturna (por defecto 06:00 AM) si cambió de día.
+        let now_minutes = now.hour() * 60 + now.minute();
+        let morning_sync_minutes = night_schedule.map(|s| s.end_minutes).unwrap_or(6 * 60);
         let is_first_run = last_sync_date.is_none();
-        let is_morning_update = last_sync_date != Some(today) && now.hour() >= 6;
+        let is_morning_update = last_sync_date != Some(today) && now_minutes >= morning_sync_minutes;
         let should_sync_network = is_first_run || is_morning_update;
 
         if should_sync_network {
@@ -249,7 +252,7 @@ fn main() {
         // - Si presionas el botón físico de encendido en cualquier momento, despierta de `mem` y sale de una vez.
         input.arm(false);
 
-        let sleep_secs = calculate_sleep_seconds(&now, config.refresh_minutes);
+        let sleep_secs = calculate_sleep_seconds(&now, config.refresh_minutes, night_schedule);
         let total_sleep = sleep_secs.max(5) as u64;
         let awake_window = if interactive_awake {
             15.min(total_sleep)
@@ -380,32 +383,62 @@ fn main() {
     app_log("[INFO] Kauwlendar finalizó correctamente.");
 }
 
-fn calculate_sleep_seconds(now: &DateTime<FixedOffset>, refresh_mins: u32) -> i64 {
-    let hour = now.hour();
+fn seconds_until_day_time(
+    now: &DateTime<FixedOffset>,
+    target_date: NaiveDate,
+    target_minutes: u32,
+) -> Option<i64> {
+    let hour = target_minutes / 60;
+    let minute = target_minutes % 60;
+    let target_naive = target_date.and_hms_opt(hour, minute, 0)?;
+    let target = target_naive.and_local_timezone(*now.offset()).single()?;
+    Some((target - *now).num_seconds().max(60))
+}
 
-    // Modo nocturno: de 21:00 (9 PM) a 06:00 AM
-    if hour >= 21 {
-        let tomorrow = now.date_naive() + Duration::days(1);
-        if let Some(target_naive) = tomorrow.and_hms_opt(6, 0, 0) {
-            if let Some(target) = target_naive.and_local_timezone(*now.offset()).single() {
-                return (target - *now).num_seconds().max(60);
-            }
-        }
-        return 9 * 3600;
-    }
-
-    if hour < 6 {
-        if let Some(target_naive) = now.date_naive().and_hms_opt(6, 0, 0) {
-            if let Some(target) = target_naive.and_local_timezone(*now.offset()).single() {
-                return (target - *now).num_seconds().max(60);
-            }
-        }
-    }
-
-    // Horas diurnas: alinear al siguiente slot
-    let step = refresh_mins.max(5) as i64 * 60;
+fn calculate_sleep_seconds(
+    now: &DateTime<FixedOffset>,
+    refresh_mins: u32,
+    night_schedule: Option<NightSchedule>,
+) -> i64 {
+    let now_minutes = now.hour() * 60 + now.minute();
     let secs_today = (now.hour() * 3600 + now.minute() * 60 + now.second()) as i64;
-    let next_slot = ((secs_today / step) + 1) * step;
+
+    if let Some(sched) = night_schedule {
+        if sched.start_minutes > sched.end_minutes {
+            // Franja nocturna que cruza medianoche (ej. 21:00 -> 06:00)
+            if now_minutes >= sched.start_minutes {
+                if let Some(secs) = seconds_until_day_time(
+                    now,
+                    now.date_naive() + Duration::days(1),
+                    sched.end_minutes,
+                ) {
+                    return secs;
+                }
+            } else if now_minutes < sched.end_minutes {
+                if let Some(secs) = seconds_until_day_time(now, now.date_naive(), sched.end_minutes)
+                {
+                    return secs;
+                }
+            }
+        } else if now_minutes >= sched.start_minutes && now_minutes < sched.end_minutes {
+            // Franja nocturna dentro del mismo día (ej. 01:00 -> 06:00)
+            if let Some(secs) = seconds_until_day_time(now, now.date_naive(), sched.end_minutes) {
+                return secs;
+            }
+        }
+    }
+
+    // Horas diurnas (o modo 24h): alinear al siguiente slot
+    let step = refresh_mins.max(5) as i64 * 60;
+    let mut next_slot = ((secs_today / step) + 1) * step;
+
+    if let Some(sched) = night_schedule {
+        let start_secs = sched.start_minutes as i64 * 60;
+        if secs_today < start_secs && next_slot > start_secs {
+            next_slot = start_secs;
+        }
+    }
+
     (next_slot - secs_today).max(60)
 }
 
@@ -425,4 +458,63 @@ fn print_cli_summary(
         }
     }
     println!("------------------------------------------------------------\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn dt(y: i32, m: u32, d: u32, hh: u32, mm: u32, ss: u32) -> DateTime<FixedOffset> {
+        let offset = FixedOffset::east_opt(-4 * 3600).unwrap();
+        offset.with_ymd_and_hms(y, m, d, hh, mm, ss).unwrap()
+    }
+
+    #[test]
+    fn test_calculate_sleep_seconds_default_cross_midnight() {
+        let sched = Some(NightSchedule {
+            start_minutes: 21 * 60,
+            end_minutes: 6 * 60,
+        });
+        assert_eq!(calculate_sleep_seconds(&dt(2026, 11, 13, 21, 0, 0), 30, sched), 9 * 3600);
+        assert_eq!(calculate_sleep_seconds(&dt(2026, 11, 14, 2, 0, 0), 30, sched), 4 * 3600);
+        assert_eq!(calculate_sleep_seconds(&dt(2026, 11, 13, 16, 17, 0), 30, sched), 13 * 60);
+    }
+
+    #[test]
+    fn test_calculate_sleep_seconds_custom_minutes_and_off() {
+        let custom = Some(NightSchedule {
+            start_minutes: 22 * 60 + 30,
+            end_minutes: 6 * 60 + 45,
+        });
+        // Clamped at night_start (22:30) instead of overshooting to 23:00 when refresh = 60
+        assert_eq!(
+            calculate_sleep_seconds(&dt(2026, 11, 13, 22, 0, 0), 60, custom),
+            30 * 60
+        );
+        // Inside custom night window (22:30 -> 06:45 = 8h 15m)
+        assert_eq!(
+            calculate_sleep_seconds(&dt(2026, 11, 13, 22, 30, 0), 30, custom),
+            8 * 3600 + 15 * 60
+        );
+        // Night mode "off" updates every 30 min 24/7
+        assert_eq!(calculate_sleep_seconds(&dt(2026, 11, 13, 23, 30, 0), 30, None), 30 * 60);
+        assert_eq!(calculate_sleep_seconds(&dt(2026, 11, 14, 2, 0, 0), 30, None), 30 * 60);
+    }
+
+    #[test]
+    fn test_calculate_sleep_seconds_same_day_window() {
+        let same_day = Some(NightSchedule {
+            start_minutes: 1 * 60,
+            end_minutes: 5 * 60 + 30,
+        });
+        assert_eq!(
+            calculate_sleep_seconds(&dt(2026, 11, 14, 1, 0, 0), 30, same_day),
+            4 * 3600 + 30 * 60
+        );
+        assert_eq!(
+            calculate_sleep_seconds(&dt(2026, 11, 14, 0, 30, 0), 30, same_day),
+            30 * 60
+        );
+    }
 }
