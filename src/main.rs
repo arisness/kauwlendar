@@ -242,11 +242,11 @@ fn main() {
             break 'main_loop;
         }
 
-        // 5. Fase de espera inteligente (Ventana inicial de 15s + Suspensión standby con rtc0/wakealarm):
+        // 5. Fase de espera inteligente (Ventana inicial de 15s + Suspensión mem con rtc0/wakealarm):
         // - Al recién entrar (o tras paginar), espera 15 segundos activos antes de suspender.
-        // - Luego apaga el frontlight y entra en `standby` programando `/sys/class/rtc/rtc0/wakealarm`.
+        // - Luego apaga el frontlight y entra en `mem` programando `/sys/class/rtc/rtc0/wakealarm`.
         // - Si vence el temporizador (`refresh_minutes`), despierta solo, actualiza la hora/vista y vuelve a dormir.
-        // - Si presionas el botón físico de encendido en cualquier momento, despierta de `standby` y sale de una vez.
+        // - Si presionas el botón físico de encendido en cualquier momento, despierta de `mem` y sale de una vez.
         input.arm(false);
 
         let sleep_secs = calculate_sleep_seconds(&now, config.refresh_minutes);
@@ -258,7 +258,7 @@ fn main() {
         };
 
         app_log(&format!(
-            "[INFO] Ventana activa por {}s (luego standby RTC). Próxima actualización en {} minutos ({} segundos)...",
+            "[INFO] Ventana activa por {}s (luego suspensión mem RTC). Próxima actualización en {} minutos ({} segundos)...",
             awake_window,
             total_sleep / 60,
             total_sleep
@@ -324,14 +324,14 @@ fn main() {
 
         if deep_sleep_secs > 0 {
             app_log(&format!(
-                "[INFO] Entrando en standby (rtc0/wakealarm) por {} segundos. Pulsa el botón físico para salir.",
+                "[INFO] Entrando en mem (rtc0/wakealarm) por {} segundos. Pulsa el botón físico para salir.",
                 deep_sleep_secs
             ));
             guard.disable_frontlight();
 
             let sleep_report = enter_deep_sleep(deep_sleep_secs, &input);
             app_log(&format!(
-                "[INFO] Retorno de standby: modo={}, sys={}ms, rtc={}ms, salida={:?}",
+                "[INFO] Retorno de mem: modo={}, sys={}ms, rtc={}ms, salida={:?}",
                 sleep_report.mode,
                 sleep_report.sys_elapsed_ms,
                 sleep_report.rtc_elapsed_ms,
@@ -345,6 +345,26 @@ fn main() {
                 DeepSleepOutcome::TimerExpired => {
                     app_log("[INFO] Alarma RTC cumplida. Actualizando vista del calendario...");
                     interactive_awake = false;
+                }
+                DeepSleepOutcome::Failed(err_msg) => {
+                    app_log(&format!("[ERROR] Falló la suspensión en mem: {}", err_msg));
+                    let (title, hint) = match config.language {
+                        Language::Es => (
+                            "Error de Suspensión (mem)",
+                            "Desconecta el cable USB de datos si está conectado al PC e inténtalo de nuevo.",
+                        ),
+                        Language::En => (
+                            "Suspend Error (mem)",
+                            "Disconnect the USB data cable if plugged into a PC and try again.",
+                        ),
+                    };
+                    render_error_screen(&mut canvas, title, &err_msg, hint, config.language);
+                    guard.pause_ui();
+                    let _ = canvas.render_to_screen();
+                    input.arm(true);
+                    app_log("Esperando toque en pantalla o botón físico para salir...");
+                    input.wait_for_exit_tap_or_timeout(30);
+                    break 'main_loop;
                 }
             }
         } else {

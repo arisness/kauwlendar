@@ -34,13 +34,14 @@ fn run_quiet(cmd: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeepSleepOutcome {
     TimerExpired,
     UserWakeup,
+    Failed(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeepSleepReport {
     pub outcome: DeepSleepOutcome,
     pub mode: &'static str,
@@ -469,11 +470,41 @@ pub fn select_elapsed_ms(
     (effective_ms, sys_elapsed_ms, rtc_elapsed_ms)
 }
 
-/// Entra en suspensión `standby` programando directamente `/sys/class/rtc/rtc0/wakealarm` en UTC.
-/// No modifica el gobernador `cpufreq` (evita bloqueos del PMIC en SoC i.MX).
-/// - Si la alarma `rtc0` se cumple: retorna `DeepSleepOutcome::TimerExpired` para refrescar la vista.
-/// - Si el usuario pulsa el botón físico de encendido antes de que venza la alarma: el hardware
-///   despierta anticipadamente y retorna `DeepSleepOutcome::UserWakeup` para salir de inmediato.
+fn classify_mem_wakeup(
+    write_error: Option<String>,
+    exit_requested: bool,
+    elapsed_ms: u64,
+    target_ms: u64,
+) -> (&'static str, DeepSleepOutcome) {
+    if let Some(err) = write_error {
+        return (
+            "mem-error",
+            DeepSleepOutcome::Failed(format!("El kernel rechazó /sys/power/state=mem: {}", err)),
+        );
+    }
+    if exit_requested {
+        return ("mem", DeepSleepOutcome::UserWakeup);
+    }
+    if elapsed_ms < 250 {
+        return (
+            "mem-aborted",
+            DeepSleepOutcome::Failed(format!(
+                "Suspensión mem abortada inmediatamente ({} ms).",
+                elapsed_ms
+            )),
+        );
+    }
+    // Si entró en `mem` y despertó antes de que venciera la alarma de rtc0,
+    // fue despertado por la interrupción física del botón de encendido -> salir de una vez.
+    if elapsed_ms + 2500 < target_ms {
+        return ("mem", DeepSleepOutcome::UserWakeup);
+    }
+    ("mem", DeepSleepOutcome::TimerExpired)
+}
+
+/// Entra en suspensión profunda estricta (`mem`) programando `/sys/class/rtc/rtc0/wakealarm` en UTC.
+/// No cambia el gobernador `cpufreq` ni hace fallback silencioso a `standby` o `Condvar`:
+/// si `mem` es rechazado o aborta de inmediato sin botón físico, retorna `DeepSleepOutcome::Failed`.
 pub fn enter_deep_sleep(
     seconds: u64,
     input: &crate::platform::InputController,
@@ -514,79 +545,45 @@ pub fn enter_deep_sleep(
     let _ = fs::write("/sys/class/rtc/rtc0/device/power/wakeup", "enabled");
 
     let target_ms = seconds * 1000;
-    let mut entered_suspend = false;
-    let mut elapsed_ms: u64 = 0;
-    let mut sys_elapsed_ms: u64 = 0;
-    let mut rtc_elapsed_ms: u64 = 0;
-    let mut used_mode: &'static str = "none";
-
     let _ = fs::write(wakealarm_path, "0");
-    if fs::write(wakealarm_path, format!("+{}", seconds)).is_ok() {
-        let before_rtc = read_rtc0_epoch_secs();
-        let before_ms = chrono::Utc::now().timestamp_millis();
-        if fs::write("/sys/power/state", "standby").is_ok() {
-            let after_rtc = read_rtc0_epoch_secs();
-            let after_ms = chrono::Utc::now().timestamp_millis();
-            (elapsed_ms, sys_elapsed_ms, rtc_elapsed_ms) =
-                select_elapsed_ms(before_ms, after_ms, before_rtc, after_rtc);
-            if elapsed_ms >= 250 {
-                entered_suspend = true;
-                used_mode = "standby";
-            }
-        }
-        let _ = fs::write(wakealarm_path, "0");
-    }
-
-    // Breve margen para procesar cualquier evento evdev pendiente al despertar
-    thread::sleep(Duration::from_millis(120));
-
-    if input.is_exit_requested() {
+    if let Err(err) = fs::write(wakealarm_path, format!("+{}", seconds)) {
         return DeepSleepReport {
-            outcome: DeepSleepOutcome::UserWakeup,
-            mode: used_mode,
-            sys_elapsed_ms,
-            rtc_elapsed_ms,
+            outcome: DeepSleepOutcome::Failed(format!(
+                "No se pudo programar rtc0/wakealarm (+{}s): {}",
+                seconds, err
+            )),
+            mode: "mem-error",
+            sys_elapsed_ms: 0,
+            rtc_elapsed_ms: 0,
         };
     }
 
-    // Si entró en `standby` y despertó antes de que venciera la alarma de rtc0,
-    // fue despertado por la interrupción física del botón de encendido -> salir de una vez.
-    if entered_suspend && elapsed_ms + 2500 < target_ms {
-        return DeepSleepReport {
-            outcome: DeepSleepOutcome::UserWakeup,
-            mode: used_mode,
-            sys_elapsed_ms,
-            rtc_elapsed_ms,
-        };
+    let before_rtc = read_rtc0_epoch_secs();
+    let before_ms = chrono::Utc::now().timestamp_millis();
+    let write_res = fs::write("/sys/power/state", "mem");
+    let after_rtc = read_rtc0_epoch_secs();
+    let after_ms = chrono::Utc::now().timestamp_millis();
+    let _ = fs::write(wakealarm_path, "0");
+
+    let (elapsed_ms, sys_elapsed_ms, rtc_elapsed_ms) =
+        select_elapsed_ms(before_ms, after_ms, before_rtc, after_rtc);
+
+    if write_res.is_ok() {
+        // Breve margen para procesar cualquier evento evdev pendiente al despertar
+        thread::sleep(Duration::from_millis(120));
     }
 
-    // Si algún wakelock temporal (ej. cable USB conectado a la PC) impidió entrar en suspensión,
-    // esperar el resto del ciclo con Condvar (0% CPU) manteniendo el táctil y botón activos.
-    if !entered_suspend {
-        used_mode = "condvar";
-        let remaining = seconds.saturating_sub(elapsed_ms / 1000);
-        if remaining > 0 {
-            if let Some(crate::platform::UserAction::Exit) =
-                input.wait_for_action_or_timeout(remaining)
-            {
-                return DeepSleepReport {
-                    outcome: DeepSleepOutcome::UserWakeup,
-                    mode: used_mode,
-                    sys_elapsed_ms,
-                    rtc_elapsed_ms,
-                };
-            }
-        }
-    }
+    let write_error = write_res.err().map(|e| e.to_string());
+    let (mode, outcome) = classify_mem_wakeup(
+        write_error,
+        input.is_exit_requested(),
+        elapsed_ms,
+        target_ms,
+    );
 
-    let outcome = if input.is_exit_requested() {
-        DeepSleepOutcome::UserWakeup
-    } else {
-        DeepSleepOutcome::TimerExpired
-    };
     DeepSleepReport {
         outcome,
-        mode: used_mode,
+        mode,
         sys_elapsed_ms,
         rtc_elapsed_ms,
     }
@@ -646,6 +643,30 @@ mod tests {
         assert_eq!(
             select_elapsed_ms(10_000, 20_500, Some(1_794_500_000), Some(1_794_500_010)),
             (10_500, 10_500, 10_000)
+        );
+    }
+
+    #[test]
+    fn test_classify_mem_wakeup_strict_failure_and_outcomes() {
+        assert!(matches!(
+            classify_mem_wakeup(Some("Device or resource busy".to_string()), false, 10, 60_000),
+            ("mem-error", DeepSleepOutcome::Failed(_))
+        ));
+        assert!(matches!(
+            classify_mem_wakeup(None, false, 80, 60_000),
+            ("mem-aborted", DeepSleepOutcome::Failed(_))
+        ));
+        assert_eq!(
+            classify_mem_wakeup(None, true, 50, 60_000),
+            ("mem", DeepSleepOutcome::UserWakeup)
+        );
+        assert_eq!(
+            classify_mem_wakeup(None, false, 10_000, 60_000),
+            ("mem", DeepSleepOutcome::UserWakeup)
+        );
+        assert_eq!(
+            classify_mem_wakeup(None, false, 59_500, 60_000),
+            ("mem", DeepSleepOutcome::TimerExpired)
         );
     }
 }
