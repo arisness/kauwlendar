@@ -2,7 +2,7 @@
 
 > **Visual, high-contrast calendar dashboard for jailbroken Amazon Kindles**, built with Rust for E-Ink displays.
 
-Kauwlendar turns your Kindle into an elegant, low-power, high-contrast daily agenda display. It fetches live events from **Google Calendar, Outlook, or Apple Calendar** (via private iCal/ICS URLs), renders a modern card-based interface optimized for E-Ink screens, and allows a clean return to the Kindle OS at any time with a single tap on the screen.
+Kauwlendar turns your Kindle into an elegant, low-power, high-contrast daily agenda display. It fetches live events from **Google Calendar, Outlook, or Apple Calendar** (via private iCal/ICS URLs), renders a crisp E-Ink schedule optimized for minimal power draw (`mem` Suspend-to-RAM with RTC wakeups), and lets you return cleanly to the Kindle OS via `[ SALIR ]` / `[ EXIT ]` or the physical power button.
 
 ---
 
@@ -28,13 +28,15 @@ Kauwlendar turns your Kindle into an elegant, low-power, high-contrast daily age
 * **Configurable 12h (AM/PM) or 24h format:**
   * Customize time formatting in `calendars.toml`.
 * **Multi-language support (English and Spanish):**
-  * Decoupled i18n architecture supporting Spanish (`language = "en"`) and English (`language = "en"`) for all interface texts, date headers, buttons, and error screens.
-* **Interactive exit button (`[ SALIR ]` / `[ EXIT ]`):**
-  * Multi-device touch input detection (`/dev/input/event*`) in the top-right corner.
-  * Pauses and resumes the Kindle graphical environment (`cvm`, `awesome`, `mesquite`) cleanly without restarting the UI framework or freezing the display.
-* **Smart Wi-Fi battery optimization:**
-  * Connects only when entering the app and during morning daily refresh (6:00 AM). Stays off throughout the day using in-memory cached events to preserve battery life.
-  * Restores the device's original Wi-Fi state upon exit.
+  * Decoupled i18n architecture supporting Spanish (`language = "es"`) and English (`language = "en"`) for all interface texts, date headers, buttons, and error screens.
+* **Interactive & hardware-button exit (`[ SALIR ]` / `[ EXIT ]` + power button):**
+  * During the initial 15-second active window (and after touch pagination in `cards` mode), tapping `[ SALIR ]` / `[ EXIT ]` returns cleanly to the Kindle OS.
+  * Once in `mem` deep sleep, pressing the physical **power button** wakes the device and exits immediately back to the Kindle interface.
+  * Pauses and resumes the Kindle graphical environment (`cvm`, `awesome`, `mesquite`, `blanket`) cleanly without restarting the UI framework or freezing the display.
+* **Ultra-low-power sleep & Wi-Fi optimization:**
+  * Suspends into `mem` (Suspend-to-RAM) between scheduled clock slots using `/sys/class/rtc/rtc0/wakealarm` and turns off the frontlight automatically while asleep.
+  * Configurable night rest window (`night_start` / `night_end`, defaulting to `21:00`–`06:00`, or `"off"` for 24-hour updates) to pause overnight refreshes until morning.
+  * Connects Wi-Fi only on launch and once per day starting at `night_end` (default `06:00 AM`). Stays off throughout the day using in-memory cached events, and restores the device's original Wi-Fi and frontlight state upon exit.
 * **Fast compilation without Docker:**
   * Includes `./build-kindle.sh` using Clang and LLVM to produce a lightweight static ARMv7 musl binary in seconds.
 * **Local PC development and preview:**
@@ -184,9 +186,9 @@ chmod +x /mnt/us/documents/Kauwlendar.sh
 
 ## Usage on Kindle
 
-1. **Launch:** From the Kindle home screen or library, tap the **Kauwlendar** book cover (or run it via KUAL / SSH).
-2. **View:** Kauwlendar will fetch today's events and refresh the E-Ink display with the card layout.
-3. **Exit:** Tap the **`[ SALIR ]`** button in the top-right corner of the screen. The native Kindle interface will resume immediately.
+1. **Launch:** From the Kindle home screen or library, tap the **Kauwlendar** book cover (or run it via KUAL / SSH). Ensure any PC USB data cable is unplugged so the kernel allows `mem` sleep.
+2. **View & Refresh:** Kauwlendar fetches today's events, renders the configured view (`timeline` or `cards`), stays touch-interactive for 15 seconds, then turns off the frontlight and enters low-power `mem` suspend — waking automatically on aligned clock slots (e.g., `xx:00` and `xx:30` when `refresh_minutes = 30`).
+3. **Exit:** Tap **`[ SALIR ]` / `[ EXIT ]`** in the top-right corner during the active window, or press the physical **power button** at any time while suspended to resume the native Kindle interface immediately.
 
 ---
 
@@ -195,7 +197,7 @@ chmod +x /mnt/us/documents/Kauwlendar.sh
 Create or edit `/mnt/us/kauwlendar/calendars.toml` (or in the repository root for local testing):
 
 ```toml
-# Refresh interval in minutes during active hours (minimum 5)
+# Refresh interval in minutes during active hours (minimum 5, aligned to clock slots)
 refresh_minutes = 60
 
 # UTC timezone offset in hours (e.g., 0 for UTC, -4 for UTC-4, -5 for UTC-5)
@@ -210,6 +212,15 @@ time_format = "12h"
 # "en" -> English (default): [ EXIT ], "Monday, November 09, 2026", "All Day"
 # "es" -> Spanish: [ SALIR ], "Lunes, 09 de Noviembre de 2026", "Todo el día"
 language = "en"
+
+# Screen view layout:
+# "timeline" -> Vertical daily schedule (Google Calendar style, default)
+# "cards"    -> Enlarged 4-card agenda view (Big Agenda Cards)
+view = "timeline"
+
+# Night rest window without screen updates ("HH:MM" in 24h format, or "off" for 24/7 updates):
+night_start = "21:00"
+night_end = "06:00"
 
 # Calendars to synchronize (supports multiple entries)
 [[calendars]]
